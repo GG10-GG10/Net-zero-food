@@ -1,0 +1,19 @@
+{
+  "folders": [
+    { "path": "." }
+  ],
+  "settings": {
+    // ① 指定解释器（核心）
+    "python.defaultInterpreterPath": "D:\\Anaconda3-202007\\envs\\py308env\\python.exe",
+
+    // ② 让 VS Code 正确调用 conda（推荐）
+    "python.condaPath": "D:\\Anaconda3-202007\\condabin\\conda.bat",
+
+    // ③ 终端自动激活该环境
+    "python.terminal.activateEnvironment": true,
+
+    // 你原来的设置，可留可去（不影响解释器选择）
+    "python.terminal.useEnvFile": true,
+    "chatgpt.openOnStartup": false
+  }
+}
