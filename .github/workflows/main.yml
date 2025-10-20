@@ -1,0 +1,29 @@
+name: LOC Report
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+jobs:
+  cloc:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cloc
+        run: sudo apt-get update && sudo apt-get install -y cloc
+      - name: Count LOC (by language)
+        run: |
+          cloc --vcs=git --json --out=cloc.json --exclude-dir=node_modules,venv,build,dist
+          cloc --vcs=git --md   --out=cloc.md   --exclude-dir=node_modules,venv,build,dist
+      - name: Attach report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloc-report
+          path: |
+            cloc.json
+            cloc.md
+      - name: Post to Summary
+        run: |
+          echo "## Lines of Code (cloc)" >> $GITHUB_STEP_SUMMARY
+          cat cloc.md >> $GITHUB_STEP_SUMMARY
