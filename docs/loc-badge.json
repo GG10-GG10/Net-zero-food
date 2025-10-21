@@ -1,0 +1,9 @@
+      - name: Make badge JSON
+        run: |
+          TOTAL=$(jq '.SUM.code' cloc.json)
+          printf '{"schemaVersion":1,"label":"LOC","message":"%s","color":"blue"}\n' "$TOTAL" > docs/loc-badge.json
+      - name: Commit badge JSON
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update LOC badge"
+          file_pattern: docs/loc-badge.json
