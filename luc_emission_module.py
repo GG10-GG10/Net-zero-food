@@ -53,12 +53,14 @@
 
 """
 from __future__ import annotations
+import os
 import re
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 import numpy as np
 import xarray as xr
 import pandas as pd
+from config_paths import get_src_base
 
 # 物理/常量
 LN2 = np.log(2.0)
@@ -137,14 +139,64 @@ def estimate_area_ha(ds: xr.Dataset) -> xr.DataArray:
 
     # 回退：球面几何
     R = 6_371_000.0
-    dlat = np.deg2rad(abs(float(ds.lat[1] - ds.lat[0])))
-    dlon = np.deg2rad(abs(float(ds.lon[1] - ds.lon[0])))
-    lat_r = np.deg2rad(ds['lat'])
-    strip = (np.sin(lat_r + dlat/2) - np.sin(lat_r - dlat/2)) * (R**2) * dlon  # m²/纬带
-    # 广播到 (lat,lon)
-    sample = ds.isel(time=0).isel(lat=slice(None), lon=slice(None))
-    area = xr.DataArray(strip, dims=['lat']).broadcast_like(sample)
-    return area * 1e-4  # ha
+    lat_vals = np.asarray(ds['lat'].values, dtype=float)
+    lon_vals = np.asarray(ds['lon'].values, dtype=float)
+    if lat_vals.size < 2 or lon_vals.size < 2:
+        raise ValueError("LUH2 dataset lat/lon dimensions are insufficient to estimate cell area")
+    dlat = np.deg2rad(abs(float(lat_vals[1] - lat_vals[0])))
+    dlon = np.deg2rad(abs(float(lon_vals[1] - lon_vals[0])))
+    lat_r = np.deg2rad(lat_vals)
+    strip = (np.sin(lat_r + dlat / 2.0) - np.sin(lat_r - dlat / 2.0)) * (R ** 2) * dlon  # m²/纬带
+    area = np.repeat(strip[:, None], lon_vals.size, axis=1)
+    return xr.DataArray(area, coords={'lat': ds['lat'], 'lon': ds['lon']}, dims=('lat', 'lon')) * 1e-4
+
+
+def _ensure_year_dim(ds: xr.Dataset, target_years: Optional[List[int]] = None) -> xr.Dataset:
+    """确保 LUH2 数据集使用整数年份维度，并按需重建年份坐标。"""
+    if 'year' not in ds.dims:
+        if 'time' not in ds.dims:
+            raise KeyError("LUH2 dataset must contain 'time' or 'year' dimension")
+        years = [int(getattr(t, 'year', getattr(t, 'year', t))) for t in ds['time'].values]
+        ds = ds.assign_coords(year=('time', years)).swap_dims({'time': 'year'}).sortby('year')
+    if target_years:
+        target_years = sorted({int(y) for y in target_years})
+        ds = ds.reindex(year=target_years, method='nearest')
+    return ds
+
+
+def _sel_year(arr: xr.DataArray, year: int) -> xr.DataArray:
+    """选择指定年份数据，缺失时回退至最近年份。"""
+    if 'year' not in arr.coords:
+        raise KeyError("DataArray missing 'year' coordinate")
+    if year in arr['year']:
+        return arr.sel(year=year)
+    return arr.sel(year=year, method='nearest')
+
+
+def _build_iso_mask(mask_ds: xr.Dataset) -> xr.DataArray:
+    """从掩膜文件生成 iso3 DataArray，必要时利用 id1→ISO3 映射。"""
+    if 'iso3' in mask_ds:
+        iso = mask_ds['iso3']
+        return iso.astype(str)
+    if 'id1' not in mask_ds:
+        raise KeyError("Mask dataset must contain 'iso3' or 'id1'")
+    id_array = np.asarray(mask_ds['id1'].values, dtype=float)
+    id_array = np.nan_to_num(id_array, nan=0.0)
+    id_int = id_array.astype(np.int64)
+    try:
+        region_df = pd.read_excel(os.path.join(get_src_base(), 'dict_v3.xlsx'), 'region')
+        region_df.columns = [str(c).strip() for c in region_df.columns]
+        region_df = region_df[['Region_maskID', 'ISO3 Code']].dropna()
+        region_df['Region_maskID'] = pd.to_numeric(region_df['Region_maskID'], errors='coerce').astype('Int64')
+        region_df = region_df.dropna(subset=['Region_maskID'])
+        id_to_iso = {int(r.Region_maskID): str(r['ISO3 Code']).strip()
+                     for r in region_df.itertuples(index=False)}
+    except Exception:
+        id_to_iso = {}
+    iso_vals = np.full(id_int.shape, '', dtype=object)
+    for mask_id, iso in id_to_iso.items():
+        iso_vals[id_int == mask_id] = iso
+    return xr.DataArray(iso_vals, coords=mask_ds['id1'].coords, dims=mask_ds['id1'].dims, name='iso3')
 
 # =========================================================
 # 3) 变量发现与外部驱动分配
@@ -184,17 +236,20 @@ _COARSE_TO_FINE = {
 }
 
 
-def _sum_over_states(ds: xr.Dataset, states: StateList, year: int) -> Optional[np.ndarray]:
-    """将多个状态分数按像元逐一相加，返回 numpy 数组（与格点形状一致）。"""
-    arrs = [ds[s].sel(time=year).values for s in states if s in ds]
-    return np.sum(arrs, axis=0) if arrs else None
+def _sum_states_cached(state_cache: Dict[str, np.ndarray], states: StateList, year_idx: int) -> Optional[np.ndarray]:
+    """在缓存中聚合指定年份的状态分数。"""
+    arrs = [state_cache[s][year_idx] for s in states if s in state_cache]
+    if not arrs:
+        return None
+    return np.sum(arrs, axis=0)
 
 
 def allocate_coarse_transitions_for_year(
-    ds: xr.Dataset,
-    area_ha: xr.DataArray,
-    iso: xr.DataArray,
-    year: int,
+    state_cache: Dict[str, np.ndarray],
+    area_ha_array: np.ndarray,
+    iso_grid: np.ndarray,
+    year_idx: int,
+    year_val: int,
     coarse_df_year: pd.DataFrame,
 ) -> List[Tuple[str, str, np.ndarray]]:
     """将**国家级粗分类转移**（单位 ha）分配到格点，输出用于瞬时“采伐”计算的清单。
@@ -212,22 +267,21 @@ def allocate_coarse_transitions_for_year(
     if coarse_df_year is None or coarse_df_year.empty:
         return outputs
 
-    iso_grid = iso.values
     for _, row in coarse_df_year.iterrows():
-        iso_code = row['iso3']
+        iso_code = str(row['iso3']).strip()
         for key, meta in _COARSE_TO_FINE.items():
             if key not in row or pd.isna(row[key]) or row[key] <= 0:
                 continue
             demand = float(row[key])  # ha（国家级）
-            from_states = [s for s in meta['from'] if s in ds]
-            to_states   = [s for s in meta['to']   if s in ds]
+            from_states = [s for s in meta['from'] if s in state_cache]
+            to_states   = [s for s in meta['to']   if s in state_cache]
             if not from_states or not to_states:
                 continue
             # 来源类别分数 → ha（格点）
-            from_frac = _sum_over_states(ds, from_states, year)
+            from_frac = _sum_states_cached(state_cache, from_states, year_idx)
             if from_frac is None:
                 continue
-            from_ha = from_frac * area_ha.values  # ha/像元
+            from_ha = from_frac * area_ha_array  # ha/像元
             # 国家掩膜
             mask = (iso_grid == iso_code)
             country_total = np.sum(from_ha[mask])
@@ -245,10 +299,10 @@ def allocate_coarse_transitions_for_year(
 # —— 外部 roundwood（m³）→ 网格采伐碳（tC） ——
 
 def allocate_roundwood_for_year(
-    ds: xr.Dataset,
-    area_ha: xr.DataArray,
-    iso: xr.DataArray,
-    year: int,
+    state_cache: Dict[str, np.ndarray],
+    area_ha_array: np.ndarray,
+    iso_grid: np.ndarray,
+    year_idx: int,
     roundwood_df_year: pd.DataFrame,
     params: dict,
 ) -> np.ndarray:
@@ -262,17 +316,16 @@ def allocate_roundwood_for_year(
 
     rho = params['rho_wood']
     cf = params['cf_wood']
-    iso_grid = iso.values
 
     # 森林面积（ha/像元）：primf + secdf
-    forest_frac = _sum_over_states(ds, ['primf', 'secdf'], year)
+    forest_frac = _sum_states_cached(state_cache, ['primf', 'secdf'], year_idx)
     if forest_frac is None:
-        return np.zeros_like(area_ha.values)
-    forest_ha = forest_frac * area_ha.values
+        return np.zeros_like(area_ha_array, dtype=float)
+    forest_ha = forest_frac * area_ha_array
 
-    harvested_tc = np.zeros_like(forest_ha)
+    harvested_tc = np.zeros_like(forest_ha, dtype=float)
     for _, r in roundwood_df_year.iterrows():
-        iso_code = r['iso3']
+        iso_code = str(r['iso3']).strip()
         m3 = float(r['roundwood_m3'])
         tc = m3 * rho * cf  # tC（国家总量）
         mask = (iso_grid == iso_code)
@@ -309,6 +362,65 @@ def aggregate_country_year(
 # 5) 主函数
 # =========================================================
 
+STATE_TO_CATEGORY = {
+    'primf': 'forest', 'secdf': 'forest',
+    'primn': 'othernat', 'secdn': 'othernat', 'range': 'othernat',
+    'pastr': 'pasture', 'urban': 'urban',
+    'crop': 'cropland', 'c3ann': 'cropland', 'c3per': 'cropland',
+    'c4ann': 'cropland', 'c4per': 'cropland', 'c3nfx': 'cropland',
+}
+
+TRANSITION_LABELS = {
+    ('forest', 'cropland'): 'forest_to_cropland',
+    ('forest', 'pasture'): 'forest_to_pasture',
+    ('cropland', 'forest'): 'cropland_to_forest',
+    ('pasture', 'forest'): 'pasture_to_forest',
+}
+
+
+def _aggregate_area_by_iso(A_ha: np.ndarray, iso: xr.DataArray) -> pd.DataFrame:
+    df = pd.DataFrame({
+        'iso3': iso.values.ravel(),
+        'area_ha': A_ha.ravel(),
+    })
+    df = df.dropna(subset=['iso3'])
+    df['area_ha'] = pd.to_numeric(df['area_ha'], errors='coerce')
+    df = df[df['area_ha'] > 0.0]
+    if df.empty:
+        return df
+    df['iso3'] = df['iso3'].astype(str).str.strip()
+    df = df[df['iso3'].astype(str).str.len() > 0]
+    return df.groupby('iso3', as_index=False)['area_ha'].sum()
+
+
+def _to_year_lat_lon(arr: xr.DataArray, allow_year: bool = True) -> np.ndarray:
+    dims = arr.dims
+    target = []
+    if allow_year and 'year' in dims:
+        target.append('year')
+    for axis in ('lat', 'latitude'):
+        if axis in dims:
+            target.append(axis)
+            break
+    for axis in ('lon', 'longitude'):
+        if axis in dims:
+            target.append(axis)
+            break
+    if allow_year and 'year' not in dims:
+        raise ValueError("DataArray 缺少 year 维度")
+    if len(target) < (3 if allow_year else 2):
+        raise ValueError(f"DataArray 缺少 lat/lon 维度: {dims}")
+    arr_t = arr.transpose(*target)
+    data = np.asarray(arr_t.values)
+    if allow_year:
+        if data.ndim != 3:
+            raise ValueError("期望三维数组 (year, lat, lon)")
+    else:
+        if data.ndim != 2:
+            raise ValueError("期望二维数组 (lat, lon)")
+    return data
+
+
 def run_luc_bookkeeping(
     luh_file: str,
     mask_file: str,
@@ -317,7 +429,8 @@ def run_luc_bookkeeping(
     out_csv: Optional[str] = None,
     coarse_transitions_df: Optional[pd.DataFrame] = None,
     roundwood_supply_df: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
+    transitions_file: Optional[str] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """运行 LUC 记账模块（支持 LUH2 + 外部粗分类 + 外部 roundwood）。
 
     参数
@@ -329,33 +442,105 @@ def run_luc_bookkeeping(
     out_csv  : 如提供，写出国家×年结果 CSV
     coarse_transitions_df : 可选，国家×年粗分类转移（单位 ha）
     roundwood_supply_df   : 可选，国家×年 roundwood（单位 m³/年）
+    transitions_file      : 可选，LUH2 transitions NetCDF（若与 luh_file 分离）
 
     返回
     ----
-    DataFrame，列：`iso3, year, F_veg_co2, F_soil_co2, F_hwp_co2, F_inst_co2, total_co2`（单位 tCO₂/年）
+    (emissions_df, transitions_df)
+      emissions_df: `iso3, year, F_veg_co2, F_soil_co2, F_hwp_co2, F_inst_co2, total_co2`
+      transitions_df: `iso3, year, transition, area_ha`
     """
     # 读取数据与参数
     params = load_params_from_excel(param_excel)
-    ds = xr.open_dataset(luh_file)
-    iso = xr.open_dataset(mask_file)['iso3']
+    try:
+        year_list = [int(y) for y in years]
+    except TypeError:
+        year_list = [int(y) for y in list(years)]
+    if not year_list:
+        raise ValueError("years must contain at least one value")
+    year_list = sorted(set(year_list))
+
+    load_all = len(year_list) <= 20
+    open_kwargs = {'chunks': {'year': len(year_list)}} if load_all else {}
+    ds_raw = xr.open_dataset(luh_file, **open_kwargs)
+    try:
+        if 'year' in ds_raw.coords:
+            hist_year_max_states = int(np.max(ds_raw['year'].values))
+        else:
+            hist_year_max_states = int(max(year_list))
+        ds = _ensure_year_dim(ds_raw, year_list)
+        ds = ds.sel(year=year_list)
+        if load_all:
+            ds = ds.load()
+    finally:
+        try:
+            ds_raw.close()
+        except Exception:
+            pass
     area_ha = estimate_area_ha(ds)
+    area_array = _to_year_lat_lon(area_ha, allow_year=False)
+    if transitions_file and os.path.exists(transitions_file):
+        trans_open_kwargs = {'chunks': {'year': len(year_list)}} if load_all else {}
+        trans_raw = xr.open_dataset(transitions_file, **trans_open_kwargs)
+        try:
+            if 'year' in trans_raw.coords:
+                hist_year_max = int(np.max(trans_raw['year'].values))
+            else:
+                hist_year_max = hist_year_max_states
+            trans_ds = _ensure_year_dim(trans_raw, year_list).sel(year=year_list)
+            if load_all:
+                trans_ds = trans_ds.load()
+        finally:
+            try:
+                trans_raw.close()
+            except Exception:
+                pass
+    else:
+        trans_ds = ds
+        hist_year_max = hist_year_max_states
+    mask_ds = xr.open_dataset(mask_file)
+    try:
+        iso = _build_iso_mask(mask_ds)
+    finally:
+        mask_ds.close()
+    iso_grid = np.asarray(iso.values)
+    iso_grid = np.where(pd.isna(iso_grid), '', iso_grid).astype(str)
 
     # 状态列表与功能类映射（用于给定稳态碳密度）
-    state_vars = ['primf', 'primn', 'secdf', 'secdn', 'urban',
-                  'crop', 'c3ann', 'c3per', 'c4ann', 'c4per', 'pastr', 'range']
+    state_vars_all = ['primf', 'primn', 'secdf', 'secdn', 'urban',
+                      'crop', 'c3ann', 'c3per', 'c4ann', 'c4per', 'pastr', 'range']
     state_to_func = {
         'primf': 'forest', 'secdf': 'forest',
         'primn': 'othernat', 'secdn': 'othernat', 'range': 'othernat',
         'pastr': 'pasture', 'urban': 'urban',
         'crop': 'cropland', 'c3ann': 'cropland', 'c3per': 'cropland', 'c4ann': 'cropland', 'c4per': 'cropland',
     }
+    state_vars = [s for s in state_vars_all if s in ds]
+    if not state_vars:
+        raise ValueError("LUH2 dataset missing expected state variables")
 
     # 自动发现 LUH2 的转移变量（如存在）
-    trans_list = discover_transitions(ds, state_vars)
+    trans_list = discover_transitions(trans_ds, state_vars)
+
+    years_arr = np.asarray(ds['year'].values, dtype=int)
+    year_index = {int(y): idx for idx, y in enumerate(years_arr)}
+    state_cache: Dict[str, np.ndarray] = {}
+    for s in state_vars:
+        state_cache[s] = _to_year_lat_lon(ds[s])
+    trans_years_arr = np.asarray(trans_ds['year'].values, dtype=int)
+    trans_year_index = {int(y): idx for idx, y in enumerate(trans_years_arr)}
+    hist_year_max = int(np.max(trans_years_arr)) if trans_years_arr.size else hist_year_max
+    trans_cache: Dict[str, np.ndarray] = {}
+    for v, _, _ in trans_list:
+        if v in trans_ds:
+            trans_cache[v] = _to_year_lat_lon(trans_ds[v])
 
     # 初始池库存（tC/ha）：以首年主导功能类的稳态作为初值（可替换为稳态解）
-    t0 = years[0] if hasattr(years, '__getitem__') else list(years)[0]
-    frac_stack0 = np.stack([ds[s].sel(time=t0).values for s in state_vars])
+    t0 = year_list[0]
+    idx0 = year_index.get(t0)
+    if idx0 is None:
+        raise ValueError(f"Year {t0} not available in LUH2 dataset")
+    frac_stack0 = np.stack([state_cache[s][idx0] for s in state_vars])
     dom_idx0 = np.argmax(frac_stack0, axis=0)
     dom_names0 = np.array(state_vars)[dom_idx0]
     func0 = np.vectorize(lambda s: state_to_func.get(s, 'othernat'))(dom_names0)
@@ -370,10 +555,14 @@ def run_luc_bookkeeping(
     f_HWP = params['frac_HWP']
 
     recs: List[pd.DataFrame] = []
+    transition_records: List[pd.DataFrame] = []
 
-    for yr in years:
+    for yr in year_list:
         # ===== 5.1 年度目标稳态（主导功能类） =====
-        frac_stack = np.stack([ds[s].sel(time=yr).values for s in state_vars])
+        year_idx = year_index.get(yr)
+        if year_idx is None:
+            continue
+        frac_stack = np.stack([state_cache[s][year_idx] for s in state_vars])
         dom_idx = np.argmax(frac_stack, axis=0)
         dom_names = np.array(state_vars)[dom_idx]
         func = np.vectorize(lambda s: state_to_func.get(s, 'othernat'))(dom_names)
@@ -385,17 +574,23 @@ def run_luc_bookkeeping(
         a_soil = 1 - np.exp(-1.0 / params['tau_soil'])
         Cveg_next = Cveg + (Cveg_star - Cveg) * a_veg
         Csoil_next = Csoil + (Csoil_star - Csoil) * a_soil
-        F_veg_tc = (Cveg - Cveg_next) * area_ha.values
-        F_soil_tc = (Csoil - Csoil_next) * area_ha.values
+        F_veg_tc = (Cveg - Cveg_next) * area_array
+        F_soil_tc = (Csoil - Csoil_next) * area_array
 
         # ===== 5.3 即时项（转移/采伐/轮耕）与 HWP 输入（tC/像元） =====
-        F_inst_tc = np.zeros(shape)
-        HWP_add_tc = np.zeros(shape)
+        F_inst_tc = np.zeros_like(area_array, dtype=float)
+        HWP_add_tc = np.zeros_like(area_array, dtype=float)
 
         # -- 5.3.1 LUH2 原生转移（如使用）--
-        if not params['replace_luh2_transitions']:
+        if (not params['replace_luh2_transitions']) and (yr <= hist_year_max):
             for v, fstate, tstate in trans_list:
-                A_ha = ds[v].sel(time=yr).values * area_ha.values  # ha/像元
+                cache = trans_cache.get(v)
+                if cache is None:
+                    continue
+                t_idx = trans_year_index.get(yr)
+                if t_idx is None:
+                    continue
+                A_ha = cache[t_idx] * area_array  # ha/像元
                 f_func = state_to_func.get(fstate, 'othernat')
                 t_func = state_to_func.get(tstate, 'othernat')
                 if f_func == t_func:
@@ -405,11 +600,18 @@ def run_luc_bookkeeping(
                 add_hwp = harvested_tc * f_HWP
                 F_inst_tc += harvested_tc - add_hwp
                 HWP_add_tc += add_hwp
+                label = TRANSITION_LABELS.get((STATE_TO_CATEGORY.get(fstate), STATE_TO_CATEGORY.get(tstate)))
+                if label:
+                    agg = _aggregate_area_by_iso(np.maximum(A_ha, 0.0), iso)
+                    if not agg.empty:
+                        agg['transition'] = label
+                        agg['year'] = int(yr)
+                        transition_records.append(agg)
 
         # -- 5.3.2 外部“粗分类转移”的格点化 --
         if coarse_transitions_df is not None:
             ydf = coarse_transitions_df[coarse_transitions_df['year'] == int(yr)]
-            syn = allocate_coarse_transitions_for_year(ds, area_ha, iso, int(yr), ydf)
+            syn = allocate_coarse_transitions_for_year(state_cache, area_array, iso_grid, year_idx, int(yr), ydf)
             for vname, fstate, tstate, A_ha in syn:
                 f_func = state_to_func.get(fstate, 'othernat')
                 t_func = state_to_func.get(tstate, 'othernat')
@@ -420,11 +622,23 @@ def run_luc_bookkeeping(
                 add_hwp = harvested_tc * f_HWP
                 F_inst_tc += harvested_tc - add_hwp
                 HWP_add_tc += add_hwp
+            if yr > hist_year_max and not ydf.empty:
+                for col in ['forest_to_cropland', 'forest_to_pasture', 'cropland_to_forest', 'pasture_to_forest']:
+                    if col in ydf.columns:
+                        tmp = ydf[['iso3', col]].copy()
+                        tmp = tmp.rename(columns={col: 'area_ha'})
+                        tmp = tmp.dropna(subset=['iso3'])
+                        tmp['transition'] = col
+                        tmp['year'] = int(yr)
+                        tmp['iso3'] = tmp['iso3'].astype(str)
+                        tmp = tmp[tmp['area_ha'] > 0.0]
+                        if len(tmp):
+                            transition_records.append(tmp)
 
         # -- 5.3.3 外部 roundwood 供给（m³）--→ tC/像元
         if roundwood_supply_df is not None:
             ydf = roundwood_supply_df[roundwood_supply_df['year'] == int(yr)]
-            harvested_tc = allocate_roundwood_for_year(ds, area_ha, iso, int(yr), ydf, params)
+            harvested_tc = allocate_roundwood_for_year(state_cache, area_array, iso_grid, year_idx, ydf, params)
             add_hwp = harvested_tc * f_HWP
             F_inst_tc += harvested_tc - add_hwp
             HWP_add_tc += add_hwp
@@ -439,7 +653,12 @@ def run_luc_bookkeeping(
                     f_func = 'forest' if prefix in ['primf', 'secdf'] else None
                     if f_func != 'forest':
                         continue
-                    A_ha = ds[v].sel(time=yr).values * area_ha.values
+                    if v not in state_cache and v in ds:
+                        state_cache[v] = _to_year_lat_lon(ds[v])
+                    cache = state_cache.get(v)
+                    if cache is None:
+                        continue
+                    A_ha = cache[year_idx] * area_array
                     per_ha_tc = params['cveg'].get('forest', 150.0) * params['pi_agb'] * params['harvest_intensity']
                     harvested_tc = A_ha * per_ha_tc
                     add_hwp = harvested_tc * f_HWP
@@ -467,7 +686,12 @@ def run_luc_bookkeeping(
         Cveg, Csoil = Cveg_next, Csoil_next
 
     # 串联所有年份
-    out = pd.concat(recs, ignore_index=True)
+    emissions_df = pd.concat(recs, ignore_index=True)
+    transitions_df = pd.concat(transition_records, ignore_index=True) if transition_records else pd.DataFrame(columns=['iso3', 'year', 'transition', 'area_ha'])
+    if not transitions_df.empty:
+        transitions_df = transitions_df[['iso3', 'year', 'transition', 'area_ha']].reset_index(drop=True)
     if out_csv:
-        out.to_csv(out_csv, index=False)
-    return out
+        emissions_df.to_csv(out_csv, index=False)
+    if transitions_file and trans_ds is not ds:
+        trans_ds.close()
+    return emissions_df, transitions_df

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 
 def get_input_base() -> str:
@@ -31,15 +32,15 @@ def get_src_base() -> str:
     return r"G:\\我的云端硬盘\\Work\\Net-zero food\\Code\\src"
 
 
-def get_results_base() -> str:
-    """Return the base directory for outputs/results.
+def get_results_base(scenario: Optional[str] = None) -> str:
+    """Return the output directory, optionally for a specific scenario.
 
-    Order of precedence:
-    1) Environment variable `NZF_OUTPUT_DIR`
-    2) If input dir ends with 'input', use its parent/'results'. Otherwise, use input/'results'.
+    Preference order:
+      1) Environment variable `NZF_OUTPUT_DIR`
+      2) Project default `G:\\我的云端硬盘\\Work\\Net-zero food\\Code\\output`
     """
     env = os.environ.get("NZF_OUTPUT_DIR")
-    if env:
-        return str(Path(env))
-    inp = Path(get_input_base())
-    return str((inp.parent / "results") if inp.name.lower() == "input" else (inp / "results"))
+    base = Path(env) if env else Path(r"C:\\Users\\cheng\\MyDrive\\Work\\Net-zero food\\Code\\output")
+    if scenario:
+        base = base / scenario
+    return str(base)

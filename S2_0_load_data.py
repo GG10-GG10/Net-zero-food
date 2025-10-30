@@ -5,10 +5,12 @@ S2.0_load_data — 数据读取与构造（对齐 dict_v3 + FAOSTAT 文件 + 情
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional, Any
+from collections import defaultdict
 import re
 import numpy as np
 import pandas as pd
 import os
+import xarray as xr
 from config_paths import get_input_base, get_src_base
 
 from S1_0_schema import Universe, ScenarioConfig, Node
@@ -29,6 +31,12 @@ class DataPaths:
     inputs_landuse_csv: str = os.path.join(get_input_base(), "Constraint", "Inputs_LandUse_E_All_Data_NOFLAG.csv")
     historical_fert_xlsx: str = os.path.join(get_input_base(), "Fertilizer", "Historical_Fertilizer_application.xlsx")
     prices_csv: str = os.path.join(get_input_base(), "Price_Cost", "Price", "World_Production_Value_per_Unit.xlsx")
+    trade_crops_xlsx: str = os.path.join(get_input_base(), "Production_Trade", "Trade_CropsLivestock_E_All_Data_NOFLAG_filtered.xlsx")
+    trade_forestry_csv: str = os.path.join(get_input_base(), "Production_Trade", "Forestry_E_All_Data_NOFLAG.csv")
+    luh2_states_nc: str = r"R:\Data\Food\LUH2\LUH2_GCB2019_states_2010_2020.nc4"
+    luh2_transitions_nc: str = r"R:\Data\Food\LUH2\LUH2_GCB2019_transitions_2010_2020.nc4"
+    luh2_mask_nc: str = r"R:\Data\Food\LUH2\mask_LUH2_025d.nc"
+    luc_param_xlsx: str = os.path.join(get_src_base(), "LUCE_parameter.xlsx")
     # optional price/cost sources under Price_Cost
     faostat_prices_csv: str = os.path.join(get_input_base(), "Price_Cost", "Price", "Prices_E_All_Data_NOFLAG.csv")
     macc_pkl: str = os.path.join(get_input_base(), "Price_Cost", "Cost", "MACC-Global-US.pkl")
@@ -149,6 +157,213 @@ def _country_by_m49(df: pd.DataFrame, universe: Universe) -> Optional[pd.Series]
     codes = pd.to_numeric(codes, errors='coerce').astype('Int64')
     vals = codes.astype(str).map(code_to_country)
     return vals
+
+
+def _estimate_area_ha_from_grid(ds: xr.Dataset) -> np.ndarray:
+    """Return grid-cell areas in hectares aligned with ds (lat, lon)."""
+    if 'areacella' in ds:
+        return np.asarray(ds['areacella'].values, dtype=float) * 1e-4
+    R = 6_371_000.0
+    lat = np.asarray(ds['lat'].values, dtype=float)
+    lon = np.asarray(ds['lon'].values, dtype=float)
+    if lat.size < 2 or lon.size < 2:
+        raise ValueError("LUH2 dataset lat/lon dimensions are insufficient to estimate cell area")
+    dlat = np.deg2rad(abs(lat[1] - lat[0]))
+    dlon = np.deg2rad(abs(lon[1] - lon[0]))
+    lat_r = np.deg2rad(lat)
+    strip = (np.sin(lat_r + dlat / 2.0) - np.sin(lat_r - dlat / 2.0)) * (R ** 2) * dlon
+    area_lat = strip  # m² per latitude band
+    # broadcast to grid shape (lat, lon)
+    area = np.repeat(area_lat[:, None], lon.size, axis=1)
+    return area * 1e-4  # convert m² to ha
+
+
+def load_luh2_land_cover(states_nc_path: str,
+                         mask_nc_path: str,
+                         universe: Universe,
+                         years: Optional[List[int]] = None) -> pd.DataFrame:
+    """Aggregate LUH2 land-cover fractions (states file) to country-level cropland/pasture/forest areas."""
+    columns = ['country', 'iso3', 'year', 'land_use', 'area_ha']
+    if not (states_nc_path and os.path.exists(states_nc_path)):
+        return pd.DataFrame(columns=columns)
+    if not (mask_nc_path and os.path.exists(mask_nc_path)):
+        return pd.DataFrame(columns=columns)
+
+    try:
+        dict_path = os.path.join(get_src_base(), 'dict_v3.xlsx')
+        region_df = _lc(pd.read_excel(dict_path, 'region'))
+    except Exception:
+        region_df = pd.DataFrame(columns=['Region_label_new', 'Region_maskID', 'ISO3 Code'])
+
+    region_df = region_df[['Region_label_new', 'Region_maskID', 'ISO3 Code']].dropna()
+    region_df['Region_maskID'] = pd.to_numeric(region_df['Region_maskID'], errors='coerce').astype('Int64')
+    region_df = region_df.dropna(subset=['Region_maskID'])
+    mask_id_to_country = {int(r.Region_maskID): str(r.Region_label_new).strip()
+                          for r in region_df.itertuples(index=False)}
+    mask_id_to_iso3 = {}
+    for mid, country in mask_id_to_country.items():
+        iso = universe.iso3_by_country.get(country)
+        if iso:
+            mask_id_to_iso3[mid] = iso
+    if not mask_id_to_iso3:
+        return pd.DataFrame(columns=columns)
+
+    target_years = sorted({int(y) for y in (years if years else universe.years or [])})
+
+    with xr.open_dataset(states_nc_path) as ds:
+        all_years = [int(getattr(t, 'year', getattr(t, 'year', t))) for t in ds['time'].values]
+        ds = ds.assign_coords(year=('time', all_years)).swap_dims({'time': 'year'}).sortby('year')
+        available_years = set(int(y) for y in ds['year'].values.tolist())
+        if not target_years:
+            target_years = sorted(available_years)
+        max_available_year = max(available_years)
+        source_years = sorted({y for y in target_years if y in available_years} | {max_available_year})
+        area_grid = _estimate_area_ha_from_grid(ds.isel(year=0))
+
+        with xr.open_dataset(mask_nc_path) as mask_ds:
+            if 'id1' not in mask_ds:
+                raise KeyError("Mask NetCDF must contain variable 'id1'")
+            id_array = np.asarray(mask_ds['id1'].values, dtype=float)
+
+        id_array = np.nan_to_num(id_array, nan=0.0)
+        id_int = id_array.astype(np.int64)
+        flat_ids = id_int.ravel()
+        valid_idx = np.where(flat_ids > 0)[0]
+        if not len(valid_idx):
+            return pd.DataFrame(columns=columns)
+        valid_ids = flat_ids[valid_idx]
+        unique_ids, inverse_idx = np.unique(valid_ids, return_inverse=True)
+
+        category_states = {
+            'cropland_area_ha': ['c3ann', 'c3per', 'c4ann', 'c4per', 'c3nfx'],
+            'pasture_area_ha': ['pastr', 'range'],
+            'forest_area_ha': ['primf', 'secdf'],
+        }
+
+        cache: Dict[int, Dict[str, np.ndarray]] = {}
+        for year in source_years:
+            cat_sums: Dict[str, np.ndarray] = {}
+            for cat_name, states in category_states.items():
+                total = None
+                for state in states:
+                    if state not in ds:
+                        continue
+                    arr = ds[state].sel(year=year).values
+                    arr = np.nan_to_num(arr, nan=0.0, copy=False)
+                    total = arr if total is None else total + arr
+                if total is None:
+                    cat_sums[cat_name] = np.zeros(len(unique_ids), dtype=float)
+                else:
+                    weighted = (total * area_grid).reshape(-1)
+                    cat_sums[cat_name] = np.bincount(
+                        inverse_idx,
+                        weights=weighted[valid_idx],
+                        minlength=len(unique_ids)
+                    )
+            cache[year] = cat_sums
+
+    records: List[Dict[str, Any]] = []
+    for year in target_years:
+        src_year = year if year in cache else max_available_year
+        cat_sums = cache.get(src_year)
+        if not cat_sums:
+            continue
+        for idx, mask_id in enumerate(unique_ids):
+            mask_id_int = int(mask_id)
+            country = mask_id_to_country.get(mask_id_int)
+            iso3 = mask_id_to_iso3.get(mask_id_int)
+            if not country or not iso3:
+                continue
+            for cat_name, sums in cat_sums.items():
+                if idx >= len(sums):
+                    continue
+                area_val = float(sums[idx])
+                if area_val <= 0.0:
+                    continue
+                records.append({
+                    'country': country,
+                    'iso3': iso3,
+                    'year': year,
+                    'land_use': cat_name,
+                    'area_ha': area_val,
+                })
+
+    if not records:
+        return pd.DataFrame(columns=columns)
+    out_df = pd.DataFrame.from_records(records, columns=columns)
+    out_df = out_df.groupby(['country', 'iso3', 'year', 'land_use'], as_index=False)['area_ha'].sum()
+    return out_df
+
+
+def load_roundwood_supply(forestry_csv_path: str,
+                          universe: Universe,
+                          years: Optional[List[int]] = None) -> pd.DataFrame:
+    """Load FAOSTAT forestry production for Roundwood as m³ per country-year."""
+    columns = ['country', 'iso3', 'year', 'roundwood_m3']
+    if not (forestry_csv_path and os.path.exists(forestry_csv_path)):
+        return pd.DataFrame(columns=columns)
+    df_raw = pd.read_csv(forestry_csv_path)
+    df = _lc(_faostat_wide_to_long(df_raw))
+    c_area = _find_col(df, ['Area'])
+    c_year = _find_col(df, ['Year'])
+    c_item = _find_col(df, ['Item'])
+    c_elem = _find_col(df, ['Element'])
+    c_val = _find_col(df, ['Value'])
+    c_unit = _maybe_find_col(df, ['Unit'])
+    if not all([c_area, c_year, c_item, c_elem, c_val]):
+        return pd.DataFrame(columns=columns)
+    z = df[[c_area, c_year, c_item, c_elem, c_val] + ([c_unit] if c_unit else [])].copy()
+    z.columns = ['area', 'year', 'item_raw', 'element', 'value'] + (['unit'] if c_unit else [])
+    m49_country = _country_by_m49(df, universe)
+    z['country'] = m49_country if m49_country is not None else z['area']
+    try:
+        maps = load_emis_item_mappings(os.path.join(get_src_base(), 'dict_v3.xlsx'))
+        z['commodity'] = z['item_raw'].map(maps.production_map).fillna(z['item_raw'])
+    except Exception:
+        z['commodity'] = z['item_raw']
+    z = z[(z['commodity'].astype(str).str.strip().str.lower() == 'roundwood') &
+          (z['country'].isin(universe.countries))]
+    if z.empty:
+        return pd.DataFrame(columns=columns)
+    z = z[z['element'].astype(str).str.contains('production', case=False, na=False)]
+    z['value'] = pd.to_numeric(z['value'], errors='coerce')
+    if c_unit:
+        z['unit'] = z['unit'].astype(str).str.lower()
+        z['roundwood_m3'] = z.apply(
+            lambda r: (r['value'] if np.isfinite(r['value']) else 0.0) *
+            (1000.0 if '1000' in r['unit'] else 1.0),
+            axis=1
+        )
+    else:
+        z['roundwood_m3'] = z['value']
+    z = z.dropna(subset=['roundwood_m3'])
+    z['roundwood_m3'] = pd.to_numeric(z['roundwood_m3'], errors='coerce').fillna(0.0)
+    if z.empty:
+        return pd.DataFrame(columns=columns)
+    agg = z.groupby(['country', 'year'], as_index=False)['roundwood_m3'].sum()
+    agg['iso3'] = agg['country'].map(universe.iso3_by_country)
+    agg = agg.dropna(subset=['iso3'])
+    agg['year'] = pd.to_numeric(agg['year'], errors='coerce').astype('Int64')
+    agg = agg.dropna(subset=['year'])
+    agg['year'] = agg['year'].astype(int)
+    if years:
+        target_years = sorted({int(y) for y in years})
+        if agg.empty:
+            return pd.DataFrame(columns=columns)
+        max_hist = int(agg['year'].max())
+        frames = [agg]
+        missing = [y for y in target_years if y not in agg['year'].values]
+        if missing and max_hist in agg['year'].values:
+            base_rows = agg[agg['year'] == max_hist]
+            for y in missing:
+                if y < max_hist and y in agg['year'].values:
+                    continue
+                tmp = base_rows.copy()
+                tmp['year'] = y
+                frames.append(tmp)
+        agg = pd.concat(frames, ignore_index=True)
+        agg = agg[agg['year'].isin(target_years)]
+    return agg[['country', 'iso3', 'year', 'roundwood_m3']]
 
 # -------------------- universe --------------------
 def build_universe_from_dict_v3(path: str, config: ScenarioConfig) -> Universe:
@@ -511,6 +726,274 @@ def build_demand_components_from_fbs(fbs_csv: str,
     result['demand_total_t'] = result['food_t'] + result['feed_t'] + result['seed_t']
     return result[['country','iso3','year','commodity','food_t','feed_t','seed_t','demand_total_t']]
 
+def _parse_m49_code(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        if isinstance(value, float) and np.isnan(value):
+            return None
+    except Exception:
+        return None
+    match = re.search(r'\d+', str(value))
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except Exception:
+        return None
+
+def _attach_country_column(df: pd.DataFrame,
+                           m49_to_country: Dict[int, str],
+                           area_lower_to_country: Dict[str, str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['country'])
+    country = pd.Series(index=df.index, dtype=object)
+    m49_col = None
+    for cand in ['Area Code (M49)', 'Area Code']:
+        if cand in df.columns:
+            m49_col = cand
+            break
+    if m49_col:
+        codes = df[m49_col].apply(_parse_m49_code)
+        country = codes.map(m49_to_country)
+    if 'Area' in df.columns:
+        missing = country.isna()
+        if missing.any():
+            area_vals = df.loc[missing, 'Area'].astype(str).str.strip().str.lower()
+            country.loc[missing] = area_vals.map(area_lower_to_country)
+    df = df.assign(country=country)
+    df = df.dropna(subset=['country'])
+    df['country'] = df['country'].astype(str)
+    return df
+
+def _melt_trade_quantities(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['country','Item','year','Element','value'])
+    year_cols = [c for c in df.columns if isinstance(c, str) and c.strip().startswith('Y') and c.strip()[1:].isdigit()]
+    if not year_cols:
+        return pd.DataFrame(columns=['country','Item','year','Element','value'])
+    df_year = df[year_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+    df = df.copy()
+    df[year_cols] = df_year
+    long_df = df.melt(id_vars=[c for c in df.columns if c not in year_cols],
+                      value_vars=year_cols,
+                      var_name='year',
+                      value_name='value')
+    long_df['year'] = pd.to_numeric(long_df['year'].astype(str).str.strip().str.lstrip('Y'), errors='coerce')
+    long_df = long_df.dropna(subset=['year'])
+    long_df['year'] = long_df['year'].astype(int)
+    long_df['value'] = pd.to_numeric(long_df['value'], errors='coerce').fillna(0.0)
+    return long_df
+
+def _load_trade_cropslivestock(path: str,
+                               items: List[str],
+                               m49_to_country: Dict[int, str],
+                               area_lower_to_country: Dict[str, str]) -> pd.DataFrame:
+    if not items or not os.path.exists(path):
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    df = _lc(pd.read_excel(path))
+    df = df[df['Item'].astype(str).str.strip().isin(items)]
+    if df.empty:
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    df = df[df['Element'].astype(str).str.lower().isin({'import quantity','export quantity'})]
+    if df.empty:
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    df = _attach_country_column(df, m49_to_country, area_lower_to_country)
+    if df.empty:
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    df['Item'] = df['Item'].astype(str).str.strip()
+    long_df = _melt_trade_quantities(df)
+    if long_df.empty:
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    long_df['Element'] = long_df['Element'].astype(str).str.lower()
+    agg = long_df.groupby(['country','Item','year','Element'], as_index=False)['value'].sum()
+    piv = agg.pivot_table(index=['country','Item','year'], columns='Element', values='value', aggfunc='sum', fill_value=0.0).reset_index()
+    import_col = 'import quantity'
+    export_col = 'export quantity'
+    if import_col not in piv.columns:
+        piv[import_col] = 0.0
+    if export_col not in piv.columns:
+        piv[export_col] = 0.0
+    piv.rename(columns={import_col: 'import_t', export_col: 'export_t'}, inplace=True)
+    return piv[['country','Item','year','import_t','export_t']]
+
+def _load_trade_forestry(path: str,
+                         items: List[str],
+                         m49_to_country: Dict[int, str],
+                         area_lower_to_country: Dict[str, str]) -> pd.DataFrame:
+    if not items or not os.path.exists(path):
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    df = _lc(pd.read_csv(path))
+    df = df[df['Item'].astype(str).str.strip().isin(items)]
+    if df.empty:
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    df = df[df['Element'].astype(str).str.lower().isin({'import quantity','export quantity'})]
+    if df.empty:
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    df = _attach_country_column(df, m49_to_country, area_lower_to_country)
+    if df.empty:
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    df['Item'] = df['Item'].astype(str).str.strip()
+    long_df = _melt_trade_quantities(df)
+    if long_df.empty:
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    long_df['Element'] = long_df['Element'].astype(str).str.lower()
+    agg = long_df.groupby(['country','Item','year','Element'], as_index=False)['value'].sum()
+    piv = agg.pivot_table(index=['country','Item','year'], columns='Element', values='value', aggfunc='sum', fill_value=0.0).reset_index()
+    import_col = 'import quantity'
+    export_col = 'export quantity'
+    if import_col not in piv.columns:
+        piv[import_col] = 0.0
+    if export_col not in piv.columns:
+        piv[export_col] = 0.0
+    piv.rename(columns={import_col: 'import_t', export_col: 'export_t'}, inplace=True)
+    return piv[['country','Item','year','import_t','export_t']]
+
+def _load_trade_fbs(path: str,
+                    items: List[str],
+                    m49_to_country: Dict[int, str],
+                    area_lower_to_country: Dict[str, str]) -> pd.DataFrame:
+    if not items or not os.path.exists(path):
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    base_cols = ['Area Code (M49)', 'Area', 'Item', 'Element', 'Unit']
+    def usecols(col: str) -> bool:
+        return col in base_cols or (isinstance(col, str) and col.startswith('Y') and col[1:].isdigit())
+    frames: List[pd.DataFrame] = []
+    for chunk in pd.read_csv(path, usecols=usecols, chunksize=200000):
+        chunk = _lc(chunk)
+        chunk['Item'] = chunk['Item'].astype(str).str.strip()
+        mask_item = chunk['Item'].isin(items)
+        if not mask_item.any():
+            continue
+        chunk = chunk.loc[mask_item]
+        chunk['Element'] = chunk['Element'].astype(str).str.lower()
+        chunk = chunk[chunk['Element'].isin({'import quantity','export quantity'})]
+        if chunk.empty:
+            continue
+        chunk = _attach_country_column(chunk, m49_to_country, area_lower_to_country)
+        if chunk.empty:
+            continue
+        year_cols = [c for c in chunk.columns if c.startswith('Y') and c[1:].isdigit()]
+        if not year_cols:
+            continue
+        values = chunk[year_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+        factors = chunk['Unit'].astype(str).str.contains('1000', case=False, na=False).replace({True: 1000.0, False: 1.0}).to_numpy()
+        values = values.mul(factors.reshape(-1, 1))
+        chunk = chunk.drop(columns=year_cols)
+        chunk[year_cols] = values
+        long_df = chunk.melt(id_vars=[c for c in chunk.columns if c not in year_cols],
+                             value_vars=year_cols,
+                             var_name='year',
+                             value_name='value')
+        long_df['year'] = pd.to_numeric(long_df['year'].astype(str).str.strip().str.lstrip('Y'), errors='coerce')
+        long_df = long_df.dropna(subset=['year'])
+        long_df['year'] = long_df['year'].astype(int)
+        long_df['value'] = pd.to_numeric(long_df['value'], errors='coerce').fillna(0.0)
+        frames.append(long_df[['country','Item','year','Element','value']])
+    if not frames:
+        return pd.DataFrame(columns=['country','Item','year','import','export'])
+    long_all = pd.concat(frames, ignore_index=True)
+    agg = long_all.groupby(['country','Item','year','Element'], as_index=False)['value'].sum()
+    piv = agg.pivot_table(index=['country','Item','year'], columns='Element', values='value', aggfunc='sum', fill_value=0.0).reset_index()
+    import_col = 'import quantity'
+    export_col = 'export quantity'
+    if import_col not in piv.columns:
+        piv[import_col] = 0.0
+    if export_col not in piv.columns:
+        piv[export_col] = 0.0
+    piv.rename(columns={import_col: 'import_t', export_col: 'export_t'}, inplace=True)
+    return piv[['country','Item','year','import_t','export_t']]
+
+def load_trade_import_export(paths: DataPaths, universe: Universe) -> Tuple[Dict[Tuple[str, str, int], float], Dict[Tuple[str, str, int], float]]:
+    try:
+        emis_df = _lc(pd.read_excel(paths.dict_v3_path, 'Emis_item'))
+    except Exception:
+        return {}, {}
+    if 'Item_Trade_Map' not in emis_df.columns or 'Trade_file_source' not in emis_df.columns or 'Item_Production_Map' not in emis_df.columns:
+        return {}, {}
+    trade_attr = _tuple_field('Item_Trade_Map')
+    trade_src_attr = _tuple_field('Trade_file_source')
+    prod_attr = _tuple_field('Item_Production_Map')
+    universe_commodities = set(universe.commodities or [])
+    trade_mapping: Dict[str, set] = defaultdict(set)
+    items_by_source: Dict[str, set] = defaultdict(set)
+    for row in emis_df.itertuples(index=False):
+        prod_val = getattr(row, prod_attr, None)
+        trade_val = getattr(row, trade_attr, None)
+        source_val = getattr(row, trade_src_attr, None)
+        if pd.isna(prod_val) or pd.isna(trade_val) or pd.isna(source_val):
+            continue
+        prod_name = str(prod_val).strip()
+        if not prod_name or prod_name.lower() in {'nan', 'no'}:
+            continue
+        if prod_name not in universe_commodities:
+            continue
+        trade_items = [item.strip() for item in str(trade_val).split(';') if item and str(item).strip().lower() not in {'nan','no'}]
+        if not trade_items:
+            continue
+        sources = [src.strip() for src in str(source_val).split(';') if src and str(src).strip().lower() not in {'nan','no'}]
+        if not sources:
+            continue
+        if len(sources) == 1 and len(trade_items) > 1:
+            sources = sources * len(trade_items)
+        elif len(sources) < len(trade_items):
+            sources = sources + [sources[-1]] * (len(trade_items) - len(sources))
+        for item, src in zip(trade_items, sources):
+            trade_mapping[prod_name].add((item, src))
+            items_by_source[src].add(item)
+    if not trade_mapping:
+        return {}, {}
+
+    m49_to_country: Dict[int, str] = {}
+    for country, code in (universe.m49_by_country or {}).items():
+        parsed = _parse_m49_code(code)
+        if parsed is not None:
+            m49_to_country[parsed] = country
+    area_lower_to_country = {str(cty).strip().lower(): cty for cty in universe.countries}
+
+    source_map = {
+        'Trade_CropsLivestock_E_All_Data_NOFLAG_filtered.xlsx': paths.trade_crops_xlsx,
+        'Forestry_E_All_Data_NOFLAG.csv': paths.trade_forestry_csv,
+        'FoodBalanceSheets_E_All_Data_NOFLAG.csv': paths.fbs_csv,
+    }
+
+    data_by_source: Dict[str, pd.DataFrame] = {}
+    for source_name, items in items_by_source.items():
+        path = source_map.get(source_name)
+        item_list = sorted({str(it).strip() for it in items if str(it).strip()})
+        if not path or not item_list:
+            continue
+        if source_name.endswith('.xlsx') and 'Trade_CropsLivestock' in source_name:
+            table = _load_trade_cropslivestock(path, item_list, m49_to_country, area_lower_to_country)
+        elif source_name.endswith('.csv') and 'Forestry' in source_name:
+            table = _load_trade_forestry(path, item_list, m49_to_country, area_lower_to_country)
+        elif source_name.endswith('.csv') and 'FoodBalance' in source_name:
+            table = _load_trade_fbs(path, item_list, m49_to_country, area_lower_to_country)
+        else:
+            table = pd.DataFrame(columns=['country','Item','year','import','export'])
+        if table is not None and not table.empty:
+            table['Item'] = table['Item'].astype(str).str.strip()
+            data_by_source[source_name] = table
+
+    imports_by = defaultdict(float)
+    exports_by = defaultdict(float)
+    for prod_name, pairs in trade_mapping.items():
+        for trade_item, source_name in pairs:
+            table = data_by_source.get(source_name)
+            if table is None or table.empty:
+                continue
+            subset = table[table['Item'] == trade_item]
+            if subset.empty:
+                continue
+            for record in subset.itertuples(index=False):
+                key = (record.country, prod_name, int(record.year))
+                imports_by[key] += float(getattr(record, 'import_t', 0.0) or 0.0)
+                exports_by[key] += float(getattr(record, 'export_t', 0.0) or 0.0)
+
+    return dict(imports_by), dict(exports_by)
+
 def apply_fbs_components_to_nodes(nodes: List[Node], fbs_components: pd.DataFrame, feed_efficiency: float=1.0) -> None:
     if fbs_components is None or len(fbs_components)==0:
         return
@@ -642,15 +1125,75 @@ def build_gv_areas_from_inputs(csv_path: str, universe: Universe) -> pd.DataFram
         return pd.DataFrame(columns=['country','iso3','year','land_use','area_ha'])
     df_raw = pd.read_csv(csv_path)
     df = _lc(_faostat_wide_to_long(df_raw))
-    c_area=_find_col(df,['Area']); c_year=_find_col(df,['Year']); c_elem=_find_col(df,['Element']); c_val=_find_col(df,['Value'])
-    # land uses aggregate mapping
-    z = df[[c_area,c_year,c_elem,c_val]].copy()
-    z.columns=['area','year','land_use','area_ha']
-    m49_country = _country_by_m49(df, universe)
-    z['country'] = m49_country if m49_country is not None else z['area']
-    z = z[z['country'].isin(universe.countries)]
-    z['iso3'] = z['country'].map(universe.iso3_by_country)
-    return z[['country','iso3','year','land_use','area_ha']]
+    c_area = _find_col(df, ['Area'])
+    c_year = _find_col(df, ['Year'])
+    c_item = _find_col(df, ['Item'])
+    c_elem = _find_col(df, ['Element'])
+    c_val  = _find_col(df, ['Value'])
+    c_unit = _maybe_find_col(df, ['Unit'])
+
+    df = df.copy()
+    mask_area = df[c_elem].astype(str).str.contains('area', case=False, na=False)
+    mask_excl = df[c_elem].astype(str).str.contains('share|per capita|value', case=False, na=False) | \
+                df[c_item].astype(str).str.contains('per capita', case=False, na=False)
+    df = df[mask_area & ~mask_excl]
+    if df.empty:
+        return pd.DataFrame(columns=['country','iso3','year','land_use','area_ha'])
+
+    if c_unit:
+        unit_series = df[c_unit].astype(str).str.strip().str.lower()
+        factor = unit_series.map(lambda u: 1000.0 if '1000' in u else 1.0)
+    else:
+        factor = 1.0
+    df[c_val] = pd.to_numeric(df[c_val], errors='coerce')
+    df[c_val] = df[c_val].multiply(factor, axis=0)
+
+    item_series = df[c_item].astype(str).str.strip().str.lower()
+    item_to_category = {
+        'cropland': 'cropland_area_ha',
+        'arable land': 'cropland_area_ha',
+        'permanent crops': 'cropland_area_ha',
+        'temporary crops': 'cropland_area_ha',
+        'forest land': 'forest_area_ha',
+        'naturally regenerating forest': 'forest_area_ha',
+        'planted forest': 'forest_area_ha',
+        'permanent meadows and pastures': 'pasture_area_ha',
+        'permanent meadows & pastures - nat. growing': 'pasture_area_ha',
+        'temporary meadows and pastures': 'pasture_area_ha',
+    }
+    df['land_use'] = item_series.map(item_to_category)
+    df = df[df['land_use'].notna()]
+    df = df[[c_area, c_year, 'land_use', c_val]].copy()
+    df.columns = ['area', 'year', 'land_use', 'area_ha']
+
+    mapped = _country_by_m49(df, universe)
+    if mapped is not None:
+        mapped_series = mapped.astype(str)
+        df['country'] = mapped_series.where(mapped_series.notna() & mapped_series.str.strip().ne(''),
+                                            df['area'].astype(str).str.strip())
+    else:
+        df['country'] = df['area'].astype(str).str.strip()
+    df = df[df['country'].isin(universe.countries)]
+    df['iso3'] = df['country'].map(universe.iso3_by_country)
+
+    hist_start = 2010
+    hist_end = 2020
+    df = df[(df['year'] >= hist_start) & (df['year'] <= hist_end)]
+
+    needed_future = [y for y in universe.years if y > hist_end]
+    if needed_future and not df.empty:
+        latest = df.sort_values('year').drop_duplicates(['country','land_use'], keep='last')
+        future_frames = []
+        for y in needed_future:
+            tmp = latest.copy()
+            tmp['year'] = y
+            future_frames.append(tmp)
+        if future_frames:
+            df = pd.concat([df] + future_frames, ignore_index=True)
+
+    df['area_ha'] = pd.to_numeric(df['area_ha'], errors='coerce').fillna(0.0)
+    df = df[df['area_ha'] > 0.0]
+    return df[['country','iso3','year','land_use','area_ha']]
 
 def build_land_use_fires_timeseries(csv_path: str, universe: Universe) -> pd.DataFrame:
     # 2010–2020 使用历史，未来保持均值
@@ -810,23 +1353,34 @@ def load_nutrient_factors_from_dict_v3(xls_path: str, indicator: str) -> Dict[st
     c_fat = 'g_fat_per_100g' if 'g_fat_per_100g' in df.columns else None
     out: Dict[str, float] = {}
     for r in df.itertuples(index=False):
-        comm = str(getattr(r, c_comm))
+        comm_val = getattr(r, c_comm)
+        if pd.isna(comm_val):
+            continue
+        comm = str(comm_val).strip()
+        if not comm or comm.lower() in {'nan', 'no'}:
+            continue
         if indicator == 'energy' and c_kcal:
             v = getattr(r, c_kcal)
             try:
-                out[comm] = float(v) * 10000.0  # 1 t = 10,000×100g
+                val = float(v) * 10000.0  # 1 t = 10,000×100g
+                if np.isfinite(val):
+                    out[comm] = val
             except Exception:
                 pass
         elif indicator == 'protein' and c_prot:
             v = getattr(r, c_prot)
             try:
-                out[comm] = float(v) * 10000.0  # grams per ton
+                val = float(v) * 10000.0  # grams per ton
+                if np.isfinite(val):
+                    out[comm] = val
             except Exception:
                 pass
         elif indicator == 'fat' and c_fat:
             v = getattr(r, c_fat)
             try:
-                out[comm] = float(v) * 10000.0  # grams per ton
+                val = float(v) * 10000.0  # grams per ton
+                if np.isfinite(val):
+                    out[comm] = val
             except Exception:
                 pass
     return out
@@ -883,6 +1437,23 @@ def load_population_wpp(csv_path: str, universe: Optional[Universe] = None) -> D
     if not (c_area and c_year and c_val):
         return out
 
+    c_elem = _maybe_find_col(df, ['Element'])
+    if c_elem:
+        mask_total = df[c_elem].astype(str).str.lower().str.contains('total population') & df[c_elem].astype(str).str.lower().str.contains('both')
+        df = df.loc[mask_total].copy()
+    if df.empty:
+        return out
+
+    unit_col = _maybe_find_col(df, ['Unit'])
+    if unit_col:
+        has_thousand = df[unit_col].astype(str).str.contains('1000', case=False, na=False)
+        if has_thousand.any():
+            df[c_val] = pd.to_numeric(df[c_val], errors='coerce') * 1000.0
+        else:
+            df[c_val] = pd.to_numeric(df[c_val], errors='coerce')
+    else:
+        df[c_val] = pd.to_numeric(df[c_val], errors='coerce')
+
     country_series = df[c_area].astype(str).str.strip()
     valid_countries = set(universe.countries) if universe is not None else None
     if universe is not None:
@@ -898,7 +1469,7 @@ def load_population_wpp(csv_path: str, universe: Optional[Universe] = None) -> D
             pop = float(pop_val)
         except Exception:
             continue
-        if np.isnan(pop):
+        if not np.isfinite(pop) or pop <= 0:
             continue
         if valid_countries is not None and country_name not in valid_countries:
             continue
@@ -1107,7 +1678,9 @@ def load_prices(csv_path: str, universe: Universe) -> pd.DataFrame:
     for r in mapping_df[[price_col, prod_col]].dropna().itertuples(index=False):
         price_name = str(getattr(r, price_col)).strip()
         prod_name = str(getattr(r, prod_col)).strip()
-        if not price_name or price_name.lower() == 'no' or not prod_name:
+        if not price_name or not prod_name:
+            continue
+        if price_name.lower() in {'nan', 'no'} or prod_name.lower() in {'nan', 'no'}:
             continue
         price_map[price_name.lower()] = prod_name
 
@@ -1352,8 +1925,14 @@ def load_emis_item_mappings(xls_path: str) -> EmisItemMappings:
             return m
         for r in df.itertuples(index=False):
             a = getattr(r, c_from, None); b = getattr(r, c_to, None)
-            if pd.notna(a) and pd.notna(b):
-                m[str(a)] = str(b)
+            if pd.isna(a) or pd.isna(b):
+                continue
+            a_str = str(a).strip(); b_str = str(b).strip()
+            if not a_str or not b_str:
+                continue
+            if a_str.lower() in {'nan', 'no'} or b_str.lower() in {'nan', 'no'}:
+                continue
+            m[a_str] = b_str
         return m
 
     return EmisItemMappings(

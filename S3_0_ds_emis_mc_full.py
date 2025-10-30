@@ -59,7 +59,7 @@ def build_model(
     data: Any,
     *,
     price_bounds=(1e-3, 1e6),
-    qty_bounds=(1e-6, 1e12),
+    qty_bounds=(1e-12, 1e12),
     npts_log: int = 25,
     nutrition_rhs: Optional[Dict[Tuple[str,int], float]] = None,
     nutrient_per_unit_by_comm: Optional[Dict[str, float]] = None,
@@ -70,8 +70,11 @@ def build_model(
     population_by_country_year: Optional[Dict[Tuple[str,int], float]] = None,
     income_mult_by_country_year: Optional[Dict[Tuple[str,int], float]] = None,
 ) -> Tuple[gp.Model, Dict[str, Dict[Tuple[str, str, int], gp.Var]]]:
-    nodes = list(getattr(data, 'nodes', []) or [])
+    nodes_all = list(getattr(data, 'nodes', []) or [])
     univ = getattr(data, 'universe', None)
+    cfg = getattr(data, 'config', None)
+    hist_end = getattr(cfg, 'years_hist_end', 2020) if cfg else 2020
+    nodes = [n for n in nodes_all if getattr(n, 'year', hist_end + 1) > hist_end]
 
     countries = sorted({n.country for n in nodes})
     commodities = sorted({n.commodity for n in nodes})
@@ -89,11 +92,15 @@ def build_model(
     # Global prices by (commodity, year)
     Pc: Dict[Tuple[str,int], gp.Var] = {}
     lnPc: Dict[Tuple[str,int], gp.Var] = {}
+    import_slack: Dict[Tuple[str,int], gp.Var] = {}
+    export_slack: Dict[Tuple[str,int], gp.Var] = {}
     for j in commodities:
         for t in years:
             Pc[j, t] = m.addVar(lb=Pmin, ub=Pmax, name=f"Pc[{j},{t}]")
             lnPc[j, t] = m.addVar(lb=-gp.GRB.INFINITY, name=f"lnPc[{j},{t}]")
             _log_pwl(m, Pc[j, t], lnPc[j, t], Pmin, Pmax, npts_log, f"logPc[{j},{t}]")
+            import_slack[j, t] = m.addVar(lb=0.0, name=f"import_slack[{j},{t}]")
+            export_slack[j, t] = m.addVar(lb=0.0, name=f"export_slack[{j},{t}]")
 
     # Node variables by (i,j,t)
     Pnet: Dict[Tuple[str,str,int], gp.Var] = {}
@@ -102,6 +109,8 @@ def build_model(
     Qd: Dict[Tuple[str,str,int], gp.Var] = {}
     lnQs: Dict[Tuple[str,str,int], gp.Var] = {}
     lnQd: Dict[Tuple[str,str,int], gp.Var] = {}
+    Wunit: Dict[Tuple[str,str,int], gp.Var] = {}
+    Taux: Dict[Tuple[str,str,int], gp.Var] = {}
 
     # Emissions and cost per node
     Eij: Dict[Tuple[str,str,int], gp.Var] = {}
@@ -179,6 +188,8 @@ def build_model(
         Cij[i, j, t] = m.addVar(lb=0.0, name=f"C[{i},{j},{t}]")
         w = m.addVar(lb=0.0, ub=Pmax, name=f"w[{i},{j},{t}]")  # unit cost adder
         t_aux = m.addVar(lb=0.0, name=f"t[{i},{j},{t}]")      # auxiliary t = w * Qs
+        Wunit[i, j, t] = w
+        Taux[i, j, t] = t_aux
 
         e0_map = getattr(n, 'e0_by_proc', {}) or {}
         e0_by_node[(i, j, t)] = dict(e0_map)
@@ -225,7 +236,10 @@ def build_model(
                     cost_terms.append(0.0 * a)
 
         # Emission definition
-        ce = m.addConstr(Eij[i, j, t] == sum_e0 * Qs[i, j, t] - gp.quicksum(a_vars) if a_vars else sum_e0 * Qs[i, j, t],
+        emis_expr = sum_e0 * Qs[i, j, t]
+        if a_vars:
+            emis_expr -= gp.quicksum(a_vars)
+        ce = m.addConstr(Eij[i, j, t] == emis_expr,
                          name=f"E_def[{i},{j},{t}]")
         constr_Edef[(i, j, t)] = ce
         # Cost definition
@@ -257,8 +271,10 @@ def build_model(
     # Market clearing per (j,t)
     for j in commodities:
         for t in years:
-            m.addConstr(gp.quicksum(Qs[i, j, t] for i in countries if (i,j,t) in Qs) ==
-                         gp.quicksum(Qd[i, j, t] for i in countries if (i,j,t) in Qd), name=f"clear[{j},{t}]")
+            supply_sum = gp.quicksum(Qs[i, j, t] for i in countries if (i,j,t) in Qs)
+            demand_sum = gp.quicksum(Qd[i, j, t] for i in countries if (i,j,t) in Qd)
+            m.addConstr(supply_sum + import_slack[j, t] == demand_sum + export_slack[j, t],
+                        name=f"clear[{j},{t}]")
 
     # Nutrition constraint (future only): sum_j nutrient_per_unit[j] * Qs[i,j,t] >= RHS[i,t]
     if nutrition_rhs and nutrient_per_unit_by_comm:
@@ -275,7 +291,7 @@ def build_model(
                         v = float(nutrient_per_unit_by_comm.get(j, 0.0) or 0.0)
                         if v > 0:
                             expr += v * Qs[i, j, t]
-                if len(expr.getVars()) > 0:
+                if expr.size() > 0:
                     cn = m.addConstr(expr >= float(rhs), name=f"nutri[{i},{t}]")
                     nutri_constr[(i, t)] = cn
 
@@ -314,25 +330,44 @@ def build_model(
         # Since total_E_land already subtracts abatements, subtract cp * 危 a(LULUCF)
         # This is approximated within per-node accumulation above.
 
+    slack_penalty = 1e-6
+    for v in import_slack.values():
+        obj += slack_penalty * v
+    for v in export_slack.values():
+        obj += slack_penalty * v
+
     m.setObjective(obj, gp.GRB.MINIMIZE)
     # expose cache for in-place MC updates
     m._nzf_cache = dict(
         Pc=Pc, lnPc=lnPc, Pnet=Pnet, lnPnet=lnPnet, Qs=Qs, Qd=Qd, lnQs=lnQs, lnQd=lnQd,
+        W=Wunit, Cij=Cij, Eij=Eij, t_aux=Taux,
         constr_supply=constr_supply, constr_demand=constr_demand,
         constr_Edef=constr_Edef, proc_cap_constr=proc_cap_constr, proc_cap_basecoeff=proc_cap_basecoeff,
         e0_by_node=e0_by_node, nutri_constr=nutri_constr, landU_constr=landU_constr,
+        import_slack=import_slack, export_slack=export_slack,
         countries=countries, commodities=commodities, years=years,
     )
     m.update()
 
-    return m, {"Qd": Qd}
+    var = {
+        "Qs": Qs,
+        "Qd": Qd,
+        "Pc": Pc,
+        "Pnet": Pnet,
+        "W": Wunit,
+        "C": Cij,
+        "E": Eij,
+        "Import": import_slack,
+        "Export": export_slack,
+    }
+    return m, var
 
 
 # ===================== MC cache (in-place updates scaffold) =====================
 @dataclass
 class SolveOpt:
     price_bounds: Tuple[float, float] = (1e-3, 1e6)
-    qty_bounds: Tuple[float, float] = (1e-6, 1e12)
+    qty_bounds: Tuple[float, float] = (1e-12, 1e12)
     npts_log: int = 25
     land_carbon_price_by_year: Optional[Dict[int, float]] = None
     grb_output: int = 0
@@ -349,6 +384,11 @@ class ModelCache:
     Qd: Dict[Tuple[str,str,int], gp.Var]
     lnQs: Dict[Tuple[str,str,int], gp.Var]
     lnQd: Dict[Tuple[str,str,int], gp.Var]
+    W: Dict[Tuple[str,str,int], gp.Var]
+    Cij: Dict[Tuple[str,str,int], gp.Var]
+    Eij: Dict[Tuple[str,str,int], gp.Var]
+    ImportSlack: Dict[Tuple[str,int], gp.Var]
+    ExportSlack: Dict[Tuple[str,int], gp.Var]
     constr_supply: Dict[Tuple[str,str,int], gp.Constr]
     constr_demand: Dict[Tuple[str,str,int], gp.Constr]
     alpha_s: Dict[Tuple[str,str,int], float]
@@ -371,6 +411,8 @@ def build_model_cache(data: Any, **kwargs) -> ModelCache:
     Pc = c.get('Pc', {}); lnPc = c.get('lnPc', {})
     Pnet = c.get('Pnet', {}); lnPnet = c.get('lnPnet', {})
     Qs = c.get('Qs', {}); Qd = c.get('Qd', {}); lnQs = c.get('lnQs', {}); lnQd = c.get('lnQd', {})
+    W = c.get('W', {}); Cij = c.get('Cij', {}); Eij = c.get('Eij', {})
+    import_slack = c.get('import_slack', {}); export_slack = c.get('export_slack', {})
     constr_supply = c.get('constr_supply', {}); constr_demand = c.get('constr_demand', {})
     constr_Edef = c.get('constr_Edef', {})
 
@@ -398,6 +440,7 @@ def build_model_cache(data: Any, **kwargs) -> ModelCache:
         alpha_d[key] = math.log(max(1e-12, D0))
 
     return ModelCache(m, Pc, lnPc, Pnet, lnPnet, Qs, Qd, lnQs, lnQd,
+                      W, Cij, Eij, import_slack, export_slack,
                       constr_supply, constr_demand, alpha_s, alpha_d,
                       eps_s, eps_d, eps_pop, eta_y, eta_temp, ymult0, tmult0,
                       _builder=c)

@@ -76,7 +76,7 @@ def compute_luc_areas(*, demand_df: pd.DataFrame, production_df: Optional[pd.Dat
         yn = [c for c in b.columns if 'year' in c.lower()][0]
         cc = [c for c in b.columns if 'crop' in c.lower()][0]
         fc = [c for c in b.columns if 'forest' in c.lower()][0]
-        gc = [c for c in b.columns if 'grass' in c.lower()][0]
+        gc = [c for c in b.columns if ('grass' in c.lower() or 'pasture' in c.lower())][0]
         b = b.rename(columns={cn:'country', yn:'year', cc:'cropland_ha', fc:'forest_ha', gc:'grassland_ha'})[['country','year','cropland_ha','forest_ha','grassland_ha']]
     else:
         b = need[['country','year']].copy()

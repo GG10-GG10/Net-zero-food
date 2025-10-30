@@ -41,9 +41,12 @@ from S2_0_load_data import (
     build_livestock_stock_from_env,
     build_gv_areas_from_inputs,
     build_land_use_fires_timeseries,
+    load_luh2_land_cover,
+    load_roundwood_supply,
     load_prices,
     load_intake_constraint,
     load_land_area_limits,
+    load_trade_import_export,
 )
 try:
     from S3_0_ds_emis_mc_full import build_model as build_model  # prefer full model if available
@@ -53,6 +56,7 @@ except Exception as exc:
     traceback.print_exc()
     sys.exit(1)
 from S3_5_land_use_change import compute_luc_areas, LUCConfig
+from luc_emission_module import run_luc_bookkeeping
 from S3_1_emissions_orchestrator_fao import EmissionsFAO, FAOPaths
 from S4_1_results import summarize_emissions, summarize_emissions_from_detail, summarize_market
 from S3_6_scenarios import (
@@ -79,6 +83,66 @@ def _load_macc_df(path: str = os.path.join(get_input_base(), 'MACC-Global-US.pkl
         return pickle.load(open(path, 'rb'))
     except Exception:
         return pd.DataFrame()
+
+
+def _build_coarse_transitions_from_deltas(deltas: Optional[pd.DataFrame],
+                                          iso_map: Dict[str, str]) -> pd.DataFrame:
+    columns = ['country', 'iso3', 'year',
+               'forest_to_cropland', 'forest_to_pasture',
+               'cropland_to_forest', 'pasture_to_forest']
+    if not isinstance(deltas, pd.DataFrame) or deltas.empty:
+        return pd.DataFrame(columns=columns)
+    df = deltas.copy()
+    df['iso3'] = df['country'].map(iso_map)
+    df = df.dropna(subset=['iso3'])
+    records: List[Dict[str, Any]] = []
+    for row in df.itertuples(index=False):
+        try:
+            country = str(getattr(row, 'country'))
+            iso3 = str(getattr(row, 'iso3'))
+            year = int(getattr(row, 'year'))
+            dc = float(getattr(row, 'd_cropland_ha', 0.0) or 0.0)
+            dg = float(getattr(row, 'd_grassland_ha', 0.0) or 0.0)
+            df_forest = float(getattr(row, 'd_forest_ha', 0.0) or 0.0)
+        except Exception:
+            continue
+        fc = max(dc, 0.0)
+        fp = max(dg, 0.0)
+        cf = max(-dc, 0.0)
+        pf = max(-dg, 0.0)
+        forest_loss = max(-df_forest, 0.0)
+        forest_gain = max(df_forest, 0.0)
+        if fc + fp > 0.0:
+            if forest_loss > 0.0:
+                scale = forest_loss / (fc + fp)
+                fc *= scale
+                fp *= scale
+            else:
+                fc = 0.0
+                fp = 0.0
+        if cf + pf > 0.0:
+            if forest_gain > 0.0:
+                scale = forest_gain / (cf + pf)
+                cf *= scale
+                pf *= scale
+            else:
+                cf = 0.0
+                pf = 0.0
+        if (fc + fp + cf + pf) <= 0.0:
+            continue
+        records.append({
+            'country': country,
+            'iso3': iso3,
+            'year': year,
+            'forest_to_cropland': max(fc, 0.0),
+            'forest_to_pasture': max(fp, 0.0),
+            'cropland_to_forest': max(cf, 0.0),
+            'pasture_to_forest': max(pf, 0.0),
+        })
+    if not records:
+        return pd.DataFrame(columns=columns)
+    out = pd.DataFrame.from_records(records, columns=columns)
+    return out.groupby(['country', 'iso3', 'year'], as_index=False).sum()
 
 def _macc_fraction_for(price: float, df: pd.DataFrame, country: str, process: str) -> float:
     """Return cumulative abatement fraction for given land carbon price, country, and process."""
@@ -220,6 +284,8 @@ def build_detailed_outputs(data: ScenarioData,
     demand_by = defaultdict(float)
     cost_by = defaultdict(float)
     emis_by = defaultdict(float)
+    import_by = defaultdict(float)
+    export_by = defaultdict(float)
     energy_total = defaultdict(float)
     protein_total = defaultdict(float)
     population_by: Dict[Tuple[str,int], float] = {}
@@ -245,18 +311,36 @@ def build_detailed_outputs(data: ScenarioData,
             unit_cost = np.nan
             abat_cost = np.nan
             emis = np.nan
+        import_hist = None
+        export_hist = None
+        meta = getattr(node, 'meta', None)
+        if isinstance(meta, dict):
+            import_hist = meta.get('import_hist')
+            export_hist = meta.get('export_hist')
 
-        imp = max(demand - supply, 0.0) if np.isfinite(supply) and np.isfinite(demand) else np.nan
-        exp = max(supply - demand, 0.0) if np.isfinite(supply) and np.isfinite(demand) else np.nan
+        if s_var is not None or d_var is not None:
+            imp = max(demand - supply, 0.0) if np.isfinite(supply) and np.isfinite(demand) else np.nan
+            exp = max(supply - demand, 0.0) if np.isfinite(supply) and np.isfinite(demand) else np.nan
+        else:
+            imp = max(demand - supply, 0.0) if np.isfinite(supply) and np.isfinite(demand) else np.nan
+            exp = max(supply - demand, 0.0) if np.isfinite(supply) and np.isfinite(demand) else np.nan
+
+        if import_hist is not None or export_hist is not None:
+            imp = float(import_hist or 0.0)
+            exp = float(export_hist or 0.0)
         supply_by[(i, t)] += 0.0 if not np.isfinite(supply) else supply
         demand_by[(i, t)] += 0.0 if not np.isfinite(demand) else demand
         cost_by[(i, t)] += 0.0 if not np.isfinite(abat_cost) else abat_cost
         emis_by[(i, t)] += 0.0 if not np.isfinite(emis) else emis
+        if np.isfinite(imp):
+            import_by[(i, t)] += imp
+        if np.isfinite(exp):
+            export_by[(i, t)] += exp
         e_factor = energy_map.get(j)
-        if np.isfinite(demand) and e_factor is not None:
+        if np.isfinite(demand) and e_factor is not None and np.isfinite(e_factor):
             energy_total[(i, t)] += demand * float(e_factor)
         p_factor = protein_map.get(j)
-        if np.isfinite(demand) and p_factor is not None:
+        if np.isfinite(demand) and p_factor is not None and np.isfinite(p_factor):
             protein_total[(i, t)] += demand * float(p_factor)
 
         pop_val = _baseline_float(population_map.get((i, t)), np.nan)
@@ -320,11 +404,11 @@ def build_detailed_outputs(data: ScenarioData,
     for key, total in energy_total.items():
         pop = population_by.get(key, _baseline_float(population_map.get(key), np.nan))
         if pop and pop > 0:
-            energy_pc[key] = total / float(pop)
+            energy_pc[key] = total / (float(pop) * 365.0)
     for key, total in protein_total.items():
         pop = population_by.get(key, _baseline_float(population_map.get(key), np.nan))
         if pop and pop > 0:
-            protein_pc[key] = total / float(pop)
+            protein_pc[key] = total / (float(pop) * 365.0)
 
     for row in rows:
         key = (row['country'], row['year'])
@@ -353,8 +437,8 @@ def build_detailed_outputs(data: ScenarioData,
             'year': year,
             'total_supply_t': total_supply,
             'total_demand_t': total_demand,
-            'imports_t': imports,
-            'exports_t': exports,
+            'imports_t': import_by.get((country, year), imports),
+            'exports_t': export_by.get((country, year), exports),
             'net_trade_t': total_supply - total_demand if np.isfinite(total_supply) and np.isfinite(total_demand) else np.nan,
             'fertilizer_input_n_t': fert_map.get((country, year), np.nan),
             'fertilizer_efficiency_t_output_per_tN': fert_eff_map.get((country, year), np.nan),
@@ -399,9 +483,58 @@ def build_detailed_outputs(data: ScenarioData,
         'node_detail': node_df,
         'country_year_summary': pd.DataFrame(country_year_rows),
         'nutrition_per_capita': pd.DataFrame(nutrition_rows),
-        'land_use_summary': pd.DataFrame(land_rows),
+        'land_use_LUH2_summary': pd.DataFrame(land_rows),
         'emissions_detail': pd.DataFrame(emis_detail_rows),
     }
+
+def apply_trade_baseline_to_nodes(nodes: List[Node],
+                                  *,
+                                  hist_end: int,
+                                  trade_imports: Dict[Tuple[str, str, int], float],
+                                  trade_exports: Dict[Tuple[str, str, int], float]) -> Dict[Tuple[str, str], Tuple[int, float]]:
+    """Override historical D0 using trade flows: Qd = Qs + Import - Export."""
+    latest_hist: Dict[Tuple[str, str], Tuple[int, float]] = {}
+    if not trade_imports and not trade_exports:
+        for n in nodes:
+            if n.year <= hist_end:
+                d0 = float(getattr(n, 'D0', 0.0) or 0.0)
+                key = (n.country, n.commodity)
+                prev = latest_hist.get(key)
+                if prev is None or n.year >= prev[0]:
+                    latest_hist[key] = (n.year, d0)
+        for n in nodes:
+            if n.year > hist_end:
+                if float(getattr(n, 'D0', 0.0) or 0.0) <= 0.0:
+                    prev = latest_hist.get((n.country, n.commodity))
+                    if prev is not None and prev[1] > 0.0:
+                        n.D0 = prev[1]
+        return latest_hist
+
+    for n in nodes:
+        key_full = (n.country, n.commodity, n.year)
+        if n.year <= hist_end:
+            imp = float(trade_imports.get(key_full, 0.0) or 0.0)
+            exp = float(trade_exports.get(key_full, 0.0) or 0.0)
+            supply = float(getattr(n, 'Q0', 0.0) or 0.0)
+            demand = max(supply + imp - exp, 0.0)
+            n.D0 = demand
+            try:
+                if isinstance(n.meta, dict):
+                    n.meta['import_hist'] = imp
+                    n.meta['export_hist'] = exp
+            except Exception:
+                pass
+            key = (n.country, n.commodity)
+            prev = latest_hist.get(key)
+            if prev is None or n.year >= prev[0]:
+                latest_hist[key] = (n.year, demand)
+    for n in nodes:
+        if n.year > hist_end:
+            if float(getattr(n, 'D0', 0.0) or 0.0) <= 0.0:
+                prev = latest_hist.get((n.country, n.commodity))
+                if prev is not None and prev[1] > 0.0:
+                    n.D0 = prev[1]
+    return latest_hist
 
 # -------------- main pipeline --------------
 
@@ -450,7 +583,13 @@ def run_one_pipeline(paths: DataPaths,
     data = ScenarioData(nodes=nodes, universe=universe, config=cfg)
     active_years = sorted({n.year for n in data.nodes})
     _log_step("\u5df2\u6784\u5efa Universe \u4e0e\u8282\u70b9")
-    
+    luc_area_long = pd.DataFrame()
+    luc_emis_detail = pd.DataFrame()
+    luc_emis_summary = pd.DataFrame()
+    coarse_transitions_df = pd.DataFrame()
+    roundwood_supply_df = pd.DataFrame()
+    base_area_df = pd.DataFrame()
+
     # 2) Elasticities
     apply_supply_ty_elasticity(data.nodes, paths.elasticity_xlsx)
     # Demand cross-price & population elasticities
@@ -465,6 +604,7 @@ def run_one_pipeline(paths: DataPaths,
 
     # 3) Activities (S2 auto-build)
     production_df = build_production_from_faostat(paths.production_faostat_csv, universe)
+    roundwood_supply_df = load_roundwood_supply(paths.trade_forestry_csv, universe, years=active_years)
     prod_lookup: Dict[Tuple[str, str, int], float] = {}
     latest_hist_prod: Dict[Tuple[str, str], Tuple[int, float]] = {}
     if len(production_df):
@@ -482,6 +622,20 @@ def run_one_pipeline(paths: DataPaths,
                 prev = latest_hist_prod.get(key)
                 if prev is None or year >= prev[0]:
                     latest_hist_prod[key] = (year, value)
+        if isinstance(roundwood_supply_df, pd.DataFrame) and not roundwood_supply_df.empty:
+            for r in roundwood_supply_df.itertuples(index=False):
+                try:
+                    country = str(getattr(r, 'country'))
+                    year = int(getattr(r, 'year'))
+                    value = float(getattr(r, 'roundwood_m3') or 0.0)
+                except Exception:
+                    continue
+                key = (country, 'Roundwood', year)
+                prod_lookup[key] = value
+                if year <= cfg.years_hist_end and value > 0:
+                    prev = latest_hist_prod.get((country, 'Roundwood'))
+                    if prev is None or year >= prev[0]:
+                        latest_hist_prod[(country, 'Roundwood')] = (year, value)
         for n in data.nodes:
             val = prod_lookup.get((n.country, n.commodity, n.year))
             if val is None and n.year > cfg.years_hist_end:
@@ -499,6 +653,8 @@ def run_one_pipeline(paths: DataPaths,
     data.gce_rice_df        = gce_act['rice_df']
     data.gce_fertilizers_df = gce_act['fertilizers_df']
 
+    trade_imports, trade_exports = load_trade_import_export(paths, universe)
+
     # 4) Demand from FBS (Food/Feed/Seed) with mapped commodities
     fbs_comp = build_demand_components_from_fbs(
         paths.fbs_csv,
@@ -507,29 +663,31 @@ def run_one_pipeline(paths: DataPaths,
         latest_hist_prod=latest_hist_prod,
     )
     apply_fbs_components_to_nodes(data.nodes, fbs_comp, feed_efficiency=cfg.feed_efficiency)
-    latest_hist_demand: Dict[Tuple[str, str], Tuple[int, float]] = {}
-    for n in data.nodes:
-        if n.year <= cfg.years_hist_end:
-            d0 = float(getattr(n, 'D0', 0.0) or 0.0)
-            if d0 > 0.0:
-                key = (n.country, n.commodity)
-                prev = latest_hist_demand.get(key)
-                if prev is None or n.year >= prev[0]:
-                    latest_hist_demand[key] = (n.year, d0)
-    for n in data.nodes:
-        if n.year > cfg.years_hist_end:
-            d0 = float(getattr(n, 'D0', 0.0) or 0.0)
-            if d0 <= 0.0:
-                prev = latest_hist_demand.get((n.country, n.commodity))
-                if prev is not None and prev[1] > 0.0:
-                    n.D0 = prev[1]
-    _log_step("\u5df2\u5e94\u7528 FBS \u9700\u6c42\u62c6\u5206")
+    latest_hist_demand = apply_trade_baseline_to_nodes(
+        data.nodes,
+        hist_end=cfg.years_hist_end,
+        trade_imports=trade_imports,
+        trade_exports=trade_exports,
+    )
+    _log_step("\u5df2\u5e94\u7528 FBS \u9700\u6c42\u62c6\u5206\uff0c\u5df2\u6839\u636e\u8d38\u6613\u6570\u636e\u66f4\u65b0\u57fa\u51c6\u9700\u6c42")
 
     latest_hist_supply: Dict[Tuple[str, str], float] = {k: v[1] for k, v in latest_hist_prod.items()}
 
     data.gle_livestock_stock_df = build_livestock_stock_from_env(paths.livestock_patterns_csv, universe)
-    data.gos_areas_df           = build_gv_areas_from_inputs(paths.inputs_landuse_csv, universe)
-    fires_df                    = build_land_use_fires_timeseries(paths.emis_fires_csv, universe)
+    luh2_land_df = load_luh2_land_cover(paths.luh2_states_nc, paths.luh2_mask_nc, universe, years=active_years)
+    if isinstance(luh2_land_df, pd.DataFrame) and not luh2_land_df.empty:
+        data.gos_areas_df = luh2_land_df
+        base_area_df = luh2_land_df.pivot_table(
+            index=['country', 'iso3', 'year'],
+            columns='land_use',
+            values='area_ha',
+            aggfunc='sum'
+        ).reset_index()
+        base_area_df.columns.name = None
+    else:
+        data.gos_areas_df = build_gv_areas_from_inputs(paths.inputs_landuse_csv, universe)
+        base_area_df = pd.DataFrame()
+    fires_df = build_land_use_fires_timeseries(paths.emis_fires_csv, universe)
     # 4.1) Derive yield0 (t/ha) from production & area for historical baseline and assign to nodes
     try:
         from S2_0_load_data import compute_yield_from_prod_area, assign_yield0_to_nodes
@@ -602,10 +760,90 @@ def run_one_pipeline(paths: DataPaths,
     # Build demand_df for LUC
     crop_rows = [(n.country, n.year, n.commodity, float(n.D0 if n.D0 > 0 else n.Q0)) for n in data.nodes]
     crop_demand_df = pd.DataFrame(crop_rows, columns=['country', 'year', 'commodity', 'demand_t'])
-    _ = compute_luc_areas(demand_df=crop_demand_df,
-                          production_df=production_df,
-                          cfg=LUCConfig(land_carbon_price_per_tco2=float(land_cp_by_year.get(2080, 0.0))))
+    luc_result = compute_luc_areas(
+        demand_df=crop_demand_df,
+        production_df=production_df,
+        base_area_df=base_area_df,
+        cfg=LUCConfig(land_carbon_price_per_tco2=float(land_cp_by_year.get(2080, 0.0)))
+    )
     _log_step("\u5df2\u5b8c\u6210\u571f\u5730\u5229\u7528\u53d8\u5316\u524d\u7f6e\u8ba1\u7b97")
+    luc_area_df = luc_result.get('luc_area')
+    if isinstance(luc_area_df, pd.DataFrame) and not luc_area_df.empty:
+        luc_area_df = luc_area_df.copy()
+        luc_area_df['iso3'] = luc_area_df['country'].map(universe.iso3_by_country)
+        luc_area_df = luc_area_df.dropna(subset=['iso3'])
+        value_cols = [c for c in luc_area_df.columns if c.endswith('_ha') and c not in {'country', 'iso3', 'year'}]
+        rename_map = {c: c.replace('_ha', '_area_ha') for c in value_cols if not c.endswith('_area_ha')}
+        luc_area_df = luc_area_df.rename(columns=rename_map)
+        value_cols = [rename_map.get(c, c) for c in value_cols]
+        luc_area_long = luc_area_df.melt(
+            id_vars=['country', 'iso3', 'year'],
+            value_vars=value_cols,
+            var_name='land_use',
+            value_name='area_ha'
+        )
+    luc_deltas_df = luc_result.get('deltas')
+    coarse_transitions_df = _build_coarse_transitions_from_deltas(luc_deltas_df, universe.iso3_by_country)
+    if not coarse_transitions_df.empty:
+        coarse_transitions_df['iso3'] = coarse_transitions_df['iso3'].astype(str)
+
+    roundwood_for_luc = None
+    if isinstance(roundwood_supply_df, pd.DataFrame) and not roundwood_supply_df.empty:
+        roundwood_for_luc = roundwood_supply_df[['iso3', 'year', 'roundwood_m3']].copy()
+        roundwood_for_luc['iso3'] = roundwood_for_luc['iso3'].astype(str)
+
+    _log_step(
+        "LUC 输入摘要："
+        f" area_rows={0 if luc_area_df is None else len(luc_area_df)}, "
+        f"base_cols={list(base_area_df.columns) if isinstance(base_area_df, pd.DataFrame) and len(base_area_df.columns) <= 10 else 'N/A'}, "
+        f"coarse_rows={0 if coarse_transitions_df is None else len(coarse_transitions_df)}, "
+        f"coarse_cols={list(coarse_transitions_df.columns) if isinstance(coarse_transitions_df, pd.DataFrame) and len(coarse_transitions_df.columns) <= 10 else 'N/A'}, "
+        f"roundwood_rows={0 if roundwood_for_luc is None else len(roundwood_for_luc)}"
+    )
+    try:
+        luc_emis_summary, luc_transitions_hist = run_luc_bookkeeping(
+            luh_file=paths.luh2_states_nc,
+            mask_file=paths.luh2_mask_nc,
+            years=active_years,
+            param_excel=paths.luc_param_xlsx,
+            coarse_transitions_df=coarse_transitions_df if not coarse_transitions_df.empty else None,
+            roundwood_supply_df=roundwood_for_luc if roundwood_for_luc is not None and not roundwood_for_luc.empty else None,
+            transitions_file=paths.luh2_transitions_nc if os.path.exists(paths.luh2_transitions_nc) else None,
+        )
+        _log_step("\u5df2\u751f\u6210 LUC \u8bb0\u8d26\u6392\u653e")
+    except Exception as exc:
+        detail = traceback.format_exc()
+        _log_step(f"LUC \u8bb0\u8d26\u6a21\u5757\u6267\u884c\u5931\u8d25\uff1a{exc}\n{detail}")
+        raise
+
+    if isinstance(luc_emis_summary, pd.DataFrame) and not luc_emis_summary.empty:
+        iso_to_country = {iso: cty for cty, iso in universe.iso3_by_country.items()}
+        luc_emis_summary = luc_emis_summary.copy()
+        luc_emis_summary['country'] = luc_emis_summary['iso3'].map(iso_to_country)
+        luc_emis_summary = luc_emis_summary.dropna(subset=['country'])
+        detail_frames: List[pd.DataFrame] = []
+        for col, label in [
+            ('F_veg_co2', 'LUC:Vegetation'),
+            ('F_soil_co2', 'LUC:Soils'),
+            ('F_hwp_co2', 'LUC:HWP'),
+            ('F_inst_co2', 'LUC:Instant'),
+        ]:
+            if col not in luc_emis_summary.columns:
+                continue
+            tmp = luc_emis_summary[['country', 'iso3', 'year']].copy()
+            tmp['commodity'] = 'ALL'
+            tmp['process'] = label
+            tmp['emissions_tco2e'] = luc_emis_summary[col]
+            detail_frames.append(tmp)
+        if 'total_co2' in luc_emis_summary.columns:
+            total_df = luc_emis_summary[['country', 'iso3', 'year']].copy()
+            total_df['commodity'] = 'ALL'
+            total_df['process'] = 'LUC:Total'
+            total_df['emissions_tco2e'] = luc_emis_summary['total_co2']
+            detail_frames.append(total_df)
+        luc_emis_detail = pd.concat(detail_frames, ignore_index=True) if detail_frames else pd.DataFrame()
+    else:
+        luc_emis_detail = pd.DataFrame(columns=['country', 'iso3', 'year', 'commodity', 'process', 'emissions_tco2e'])
 
     # 7) Emission intensities from *_fao.py (strict)
     if use_fao_modules:
@@ -893,8 +1131,22 @@ def run_one_pipeline(paths: DataPaths,
         land_areas_df=data.gos_areas_df,
         land_cp_by_year=land_cp_by_year,
     )
+    if isinstance(luc_emis_summary, pd.DataFrame) and len(luc_emis_summary):
+        detailed_outputs['luc_emissions_summary'] = luc_emis_summary
+    if isinstance(luc_area_long, pd.DataFrame) and len(luc_area_long):
+        detailed_outputs['luc_area_required_summary'] = luc_area_long
+    if isinstance(luc_transitions_hist, pd.DataFrame) and len(luc_transitions_hist):
+        detailed_outputs['landuse_transitions_history'] = luc_transitions_hist
+    if isinstance(coarse_transitions_df, pd.DataFrame) and len(coarse_transitions_df):
+        detailed_outputs['landuse_transitions_summary'] = coarse_transitions_df
     _log_step("\u8be6\u7ec6\u8f93\u51fa DataFrame \u5df2\u751f\u6210")
     emission_detail_df = detailed_outputs.get('emissions_detail')
+    if isinstance(luc_emis_detail, pd.DataFrame) and len(luc_emis_detail):
+        if not isinstance(emission_detail_df, pd.DataFrame) or emission_detail_df.empty:
+            emission_detail_df = luc_emis_detail.copy()
+        else:
+            emission_detail_df = pd.concat([emission_detail_df, luc_emis_detail], ignore_index=True)
+        detailed_outputs['emissions_detail'] = emission_detail_df
     if can_emit:
         if isinstance(emission_detail_df, pd.DataFrame) and len(emission_detail_df):
             _log_step("\u5f00\u59cb\u751f\u6210\u6392\u653e\u6c47\u603b")
@@ -931,12 +1183,16 @@ def run_one_pipeline(paths: DataPaths,
         market_sum.to_csv(os.path.join(ds_dir_str, "market_summary.csv"), index=False, encoding='utf-8-sig')
     for name, df in (detailed_outputs or {}).items():
         if df is not None and len(df):
-            fname = {
+            fname_map = {
                 'node_detail': 'detailed_node_summary.csv',
                 'country_year_summary': 'country_year_summary.csv',
                 'nutrition_per_capita': 'nutrition_per_capita.csv',
-                'land_use_summary': 'land_use_summary.csv',
-            }.get(name, f"{name}.csv")
+                'land_use_LUH2_summary': 'land_use_LUH2_summary.csv',
+                'luc_area_required_summary': 'luc_area_required_summary.csv',
+                'landuse_transitions_history': 'landuse_transitions_history.csv',
+                'landuse_transitions_summary': 'landuse_transitions_summary.csv',
+            }
+            fname = fname_map.get(name, f"{name}.csv")
             df.to_csv(os.path.join(ds_dir_str, fname), index=False, encoding='utf-8-sig')
 
     if gurobi_log_actual and gurobi_log_actual != gurobi_log_path and gurobi_log_actual.exists():
@@ -1020,6 +1276,8 @@ def main():
                 if val is not None:
                     n.Q0 = float(val)
 
+        trade_imports, trade_exports = load_trade_import_export(paths, universe)
+
         # Demand from FBS
         fbs_comp = build_demand_components_from_fbs(
             paths.fbs_csv,
@@ -1028,22 +1286,12 @@ def main():
             latest_hist_prod=latest_hist_prod,
         )
         apply_fbs_components_to_nodes(data.nodes, fbs_comp, feed_efficiency=cfg.feed_efficiency)
-        latest_hist_demand: Dict[Tuple[str, str], Tuple[int, float]] = {}
-        for n in data.nodes:
-            if n.year <= cfg.years_hist_end:
-                d0 = float(getattr(n, 'D0', 0.0) or 0.0)
-                if d0 > 0.0:
-                    key = (n.country, n.commodity)
-                    prev = latest_hist_demand.get(key)
-                    if prev is None or n.year >= prev[0]:
-                        latest_hist_demand[key] = (n.year, d0)
-        for n in data.nodes:
-            if n.year > cfg.years_hist_end:
-                d0 = float(getattr(n, 'D0', 0.0) or 0.0)
-                if d0 <= 0.0:
-                    prev = latest_hist_demand.get((n.country, n.commodity))
-                    if prev is not None and prev[1] > 0.0:
-                        n.D0 = prev[1]
+        latest_hist_demand = apply_trade_baseline_to_nodes(
+            data.nodes,
+            hist_end=cfg.years_hist_end,
+            trade_imports=trade_imports,
+            trade_exports=trade_exports,
+        )
 
         # Nutrition RHS & land limits
         from S2_0_load_data import (

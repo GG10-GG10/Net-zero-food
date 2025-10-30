@@ -26,7 +26,7 @@ def build_model(
     data: Any,
     *,
     price_bounds=(1e-3, 1e6),
-    qty_bounds=(1e-6, 1e12),
+    qty_bounds=(1e-12, 1e12),
     npts_log: int = 25,
     nutrition_rhs: Optional[Dict[Tuple[str,int], float]] = None,
     nutrient_per_unit_by_comm: Optional[Dict[str, float]] = None,
@@ -53,11 +53,15 @@ def build_model(
     # Variables
     Pc: Dict[Tuple[str, int], gp.Var] = {}
     lnPc: Dict[Tuple[str, int], gp.Var] = {}
+    import_slack: Dict[Tuple[str, int], gp.Var] = {}
+    export_slack: Dict[Tuple[str, int], gp.Var] = {}
     for j in commodities:
         for t in years:
             Pc[j, t] = m.addVar(lb=Pmin, ub=Pmax, name=f"Pc[{j},{t}]")
             lnPc[j, t] = m.addVar(lb=-gp.GRB.INFINITY, name=f"lnPc[{j},{t}]")
             _log_pwl(m, Pc[j, t], lnPc[j, t], Pmin, Pmax, npts_log, f"logPc[{j},{t}]")
+            import_slack[j, t] = m.addVar(lb=0.0, name=f"import_slack[{j},{t}]")
+            export_slack[j, t] = m.addVar(lb=0.0, name=f"export_slack[{j},{t}]")
 
     Pnet: Dict[Tuple[str, str, int], gp.Var] = {}
     lnPnet: Dict[Tuple[str, str, int], gp.Var] = {}
@@ -99,8 +103,9 @@ def build_model(
     # Market clearing per (j,t): sum_i Qs = sum_i Qd
     for j in commodities:
         for t in years:
-            m.addConstr(gp.quicksum(Qs[i, j, t] for i in countries if (i, j, t) in Qs)
-                         == gp.quicksum(Qd[i, j, t] for i in countries if (i, j, t) in Qd),
+            supply_sum = gp.quicksum(Qs[i, j, t] for i in countries if (i, j, t) in Qs)
+            demand_sum = gp.quicksum(Qd[i, j, t] for i in countries if (i, j, t) in Qd)
+            m.addConstr(supply_sum + import_slack[j, t] == demand_sum + export_slack[j, t],
                          name=f"clear[{j},{t}]")
 
     # Nutrition constraint
@@ -116,7 +121,7 @@ def build_model(
                         kpu = float(nutrient_per_unit_by_comm.get(j, 0.0) or 0.0)
                         if kpu > 0:
                             expr += kpu * Qs[i, j, t]
-                if len(expr.getVars()) > 0:
+                if expr.size() > 0:
                     m.addConstr(expr >= float(rhs), name=f"nutri[{i},{t}]")
 
     # Land area upper bound
@@ -147,7 +152,20 @@ def build_model(
             if e_land > 0:
                 obj += cp * e_land * Qs[i, j, t]
 
+    slack_penalty = 1e-6
+    for v in import_slack.values():
+        obj += slack_penalty * v
+    for v in export_slack.values():
+        obj += slack_penalty * v
+
     m.setObjective(obj)
     m.update()
 
-    return m, {"Qd": Qd}
+    return m, {
+        "Qs": Qs,
+        "Qd": Qd,
+        "Pc": Pc,
+        "Pnet": Pnet,
+        "Import": import_slack,
+        "Export": export_slack,
+    }
