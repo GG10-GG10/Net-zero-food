@@ -1,9 +1,9 @@
 ﻿# -*- coding: utf-8 -*-
 """
-Full supply鈥揹emand + emissions + MACC cost model (aligned to S1_0_schema.Node).
+Full supply-demand + emissions + MACC cost model (aligned to S1_0_schema.Node).
 
 Features
-- Log鈥搇og supply and demand with cross-price and population elasticities.
+- Log-log supply and demand with cross-price and population elasticities.
 - Global market clearing per (commodity, year).
 - Emissions as e0_by_proc * Qs with abatement decisions per process driven by MACC.
 - Land carbon price objective term for LULUCF processes.
@@ -19,18 +19,73 @@ This file intentionally does not depend on nzf_schema; it works with S1_0_schema
 
 from __future__ import annotations
 from typing import Dict, Tuple, Any, Optional, List
+import logging
 import math
 import pandas as pd
 import gurobipy as gp
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
-
-
+import sys
 def _log_pwl(model: gp.Model, x: gp.Var, y: gp.Var, xmin: float, xmax: float, npts: int, name: str):
-    xs = [xmin + k * (xmax - xmin) / max(1, (npts - 1)) for k in range(max(2, npts))]
-    ys = [math.log(max(1e-12, v)) for v in xs]
-    model.addGenConstrPWL(x, y, xs, ys, name=name)
+    """
+    Build a log PWL with log-spaced breakpoints to retain resolution at realistic volumes.
+    Evenly spaced (linear) breakpoints between 1e-12 and 1e12 create huge gaps; here we
+    space points in log-domain so Qs in tens/ hundreds map to sensible ln values.
+    """
+    lo = max(1e-12, xmin)
+    hi = max(lo * 1.01, xmax)
+    min_step_rel = 1e-9
+    # 放宽绝对间距，避免靠近 0 的断点过于密集触发 Gurobi 容差
+    min_step_abs = 1e-5
+    # If range is extremely narrow, force just two well-separated points
+    if hi / lo < 1.05:
+        xs_unique = [lo, max(hi, lo * 1.05, lo + min_step_abs)]
+    else:
+        steps = max(2, min(100, npts))
+        ratio = (hi / lo) ** (1.0 / (steps - 1))
+        xs = [lo * (ratio ** k) for k in range(steps)]
+        xs_unique = []
+        for v in xs:
+            # drop near-duplicates using both relative and absolute gaps
+            if not xs_unique:
+                xs_unique.append(v)
+                continue
+            prev = xs_unique[-1]
+            sep_tol = max(min_step_abs, min_step_rel * max(1.0, abs(prev)))
+            if abs(v - prev) > sep_tol:
+                xs_unique.append(v)
+        if len(xs_unique) < 2:
+            bump = max(min_step_abs, 0.01 * max(1.0, abs(lo)))
+            xs_unique = [lo, max(lo + bump, hi)]
+        # 如果低端区域点过多，压缩为首/中/尾三个点，避免“靠近零的多点”报错
+        small_thr = max(lo * 1e3, 1e-3)
+        small_idx = [idx for idx, val in enumerate(xs_unique) if val <= small_thr]
+        if len(small_idx) > 3:
+            keep_idx = {small_idx[0], small_idx[len(small_idx) // 2], small_idx[-1]}
+            xs_unique = [v for idx, v in enumerate(xs_unique) if idx not in small_idx or idx in keep_idx]
+    ys = [math.log(v) for v in xs_unique]
+    try:
+        model.addGenConstrPWL(x, y, xs_unique, ys, name=name)
+    except gp.GurobiError as err:
+        try:
+            lb = getattr(x, "LB", None)
+            ub = getattr(x, "UB", None)
+        except Exception:
+            lb = ub = None
+        msg = f"[PWL_ERROR] name={name}, x_bounds=({lb},{ub}), xmin={xmin}, xmax={xmax}, steps={len(xs_unique)}, err={err}"
+        # 优先写到根 logger（由 S4_0_main 配置到 model.log），再回退到模块 logger 和 stderr
+        try:
+            root_logger = logging.getLogger()
+            root_logger.error(msg)
+        except Exception:
+            pass
+        try:
+            logging.getLogger(__name__).error(msg)
+        except Exception:
+            pass
+        print(msg, file=sys.stderr)
+        raise
 
 
 def _is_lulucf_process(name: str) -> bool:
@@ -60,15 +115,21 @@ def build_model(
     *,
     price_bounds=(1e-3, 1e6),
     qty_bounds=(1e-12, 1e12),
-    npts_log: int = 25,
+    # 减少默认断点数，配合更大绝对间距降低近零密度
+    npts_log: int = 15,
     nutrition_rhs: Optional[Dict[Tuple[str,int], float]] = None,
     nutrient_per_unit_by_comm: Optional[Dict[str, float]] = None,
     land_area_limits: Optional[Dict[Tuple[str,int], float]] = None,
+    grass_area_by_region_year: Optional[Dict[Tuple[str,int], float]] = None,  # ✅ 草地面积约束
+    forest_area_by_region_year: Optional[Dict[Tuple[str,int], float]] = None,  # ✅ 森林面积约束
     yield_t_per_ha_default: float = 3.0,
     land_carbon_price_by_year: Optional[Dict[int, float]] = None,
     macc_path: Optional[str] = None,
     population_by_country_year: Optional[Dict[Tuple[str,int], float]] = None,
     income_mult_by_country_year: Optional[Dict[Tuple[str,int], float]] = None,
+    max_growth_rate_per_period: Optional[float] = None,
+    max_decline_rate_per_period: Optional[float] = None,
+    lp_output_path: Optional[str] = None,
 ) -> Tuple[gp.Model, Dict[str, Dict[Tuple[str, str, int], gp.Var]]]:
     nodes_all = list(getattr(data, 'nodes', []) or [])
     univ = getattr(data, 'universe', None)
@@ -83,6 +144,28 @@ def build_model(
     Pmin, Pmax = price_bounds
     Qmin, Qmax = qty_bounds
 
+    # Historical基准最大产量（用于未来变量上界，避免跨期约束失效时出现数量级跳变）
+    hist_max_by_comm: Dict[Tuple[str, str], float] = {}
+    hist_max_by_commodity: Dict[str, List[float]] = {}
+    for n in data.nodes:
+        if n.year <= 2020:
+            key = (n.country, n.commodity)
+            try:
+                val = float(getattr(n, 'q0_with_ty', lambda: getattr(n, 'Q0', 0.0))())
+            except Exception:
+                val = float(getattr(n, 'Q0', 0.0) or 0.0)
+            if val > 0:
+                hist_max_by_comm[key] = max(hist_max_by_comm.get(key, 0.0), val)
+                hist_max_by_commodity.setdefault(n.commodity, []).append(val)
+    countries_all = list(univ.countries) if univ and getattr(univ, 'countries', None) else sorted({n.country for n in nodes_all})
+    missing_roundwood = [c for c in countries_all if (c, 'Roundwood') not in hist_max_by_comm]
+    try:
+        logging.getLogger(__name__).info(
+            "[NZF] Roundwood 基准产量缺失国家: %d / %d, 示例: %s",
+            len(missing_roundwood), len(countries_all), missing_roundwood[:5])
+    except Exception:
+        pass
+
     m = gp.Model("nzf_full")
     m.Params.OutputFlag = 0
     m.Params.NumericFocus = 3
@@ -92,15 +175,14 @@ def build_model(
     # Global prices by (commodity, year)
     Pc: Dict[Tuple[str,int], gp.Var] = {}
     lnPc: Dict[Tuple[str,int], gp.Var] = {}
-    import_slack: Dict[Tuple[str,int], gp.Var] = {}
-    export_slack: Dict[Tuple[str,int], gp.Var] = {}
+    stock: Dict[Tuple[str,int], gp.Var] = {}
     for j in commodities:
         for t in years:
             Pc[j, t] = m.addVar(lb=Pmin, ub=Pmax, name=f"Pc[{j},{t}]")
             lnPc[j, t] = m.addVar(lb=-gp.GRB.INFINITY, name=f"lnPc[{j},{t}]")
             _log_pwl(m, Pc[j, t], lnPc[j, t], Pmin, Pmax, npts_log, f"logPc[{j},{t}]")
-            import_slack[j, t] = m.addVar(lb=0.0, name=f"import_slack[{j},{t}]")
-            export_slack[j, t] = m.addVar(lb=0.0, name=f"export_slack[{j},{t}]")
+            # 库存吸收当期全球净过剩，容量约束在市场平衡处设置
+            stock[j, t] = m.addVar(lb=0.0, ub=Qmax, name=f"stock[{j},{t}]")
 
     # Node variables by (i,j,t)
     Pnet: Dict[Tuple[str,str,int], gp.Var] = {}
@@ -132,6 +214,12 @@ def build_model(
     e0_by_node: Dict[Tuple[str,str,int], Dict[str, float]] = {}
     nutri_constr: Dict[Tuple[str,int], gp.Constr] = {}
     landU_constr: Dict[Tuple[str,int], gp.Constr] = {}
+    
+    # Slack variables for supply/demand soft constraints (prevent infeasibility from rigid log-linear equations)
+    supply_slack_pos: Dict[Tuple[str,str,int], gp.Var] = {}  # Positive deviation: actual supply > predicted
+    supply_slack_neg: Dict[Tuple[str,str,int], gp.Var] = {}  # Negative deviation: actual supply < predicted
+    demand_slack_pos: Dict[Tuple[str,str,int], gp.Var] = {}  # Positive deviation: actual demand > predicted
+    demand_slack_neg: Dict[Tuple[str,str,int], gp.Var] = {}  # Negative deviation: actual demand < predicted
 
     for (i, j, t), n in idx.items():
         # Vars
@@ -139,20 +227,71 @@ def build_model(
         lnPnet[i, j, t] = m.addVar(lb=-gp.GRB.INFINITY, name=f"lnPnet[{i},{j},{t}]")
         _log_pwl(m, Pnet[i, j, t], lnPnet[i, j, t], Pmin, Pmax, npts_log, f"logPnet[{i},{j},{t}]")
 
-        Qs[i, j, t] = m.addVar(lb=Qmin, ub=Qmax, name=f"Qs[{i},{j},{t}]")
-        Qd[i, j, t] = m.addVar(lb=Qmin, ub=Qmax, name=f"Qd[{i},{j},{t}]")
+        # Upper bound: prefer own historical max, else use commodity average of nonzero hist max
+        hist_max = hist_max_by_comm.get((i, j), None)
+        fallback_avg = None
+        vals = hist_max_by_commodity.get(j)
+        if vals:
+            try:
+                fallback_avg = float(sum(vals) / len(vals))
+            except Exception:
+                fallback_avg = None
+        base_ub = None
+        if hist_max is not None and hist_max > 0:
+            base_ub = hist_max
+        elif fallback_avg is not None and fallback_avg > 0:
+            base_ub = fallback_avg
+        else:
+            base_ub = Qmax
+
+        q_ub = base_ub
+        if t > 2020:
+            growth_rate = max_growth_rate_per_period if max_growth_rate_per_period is not None else 0.0
+            year_diff = t - 2020
+            q_ub = min(Qmax, base_ub * (1.0 + growth_rate) ** year_diff)
+        else:
+            q_ub = min(Qmax, base_ub)
+        
+        # ADAPTIVE LOWER BOUND: Use Q0/D0 to set variable bounds, allowing small baseline values
+        # This preserves calibration integrity while ensuring PWL feasibility
+        Q0_raw = float(getattr(n, 'q0_with_ty', lambda: getattr(n, 'Q0', 0.0))())
+        D0_raw = float(getattr(n, 'D0', 0.0) or 0.0)
+        # CRITICAL FIX: Use very small lower bound (1e-12) for Qs/Qd to allow slack-driven deviations
+        # The slack in supply/demand equations can change lnQs/lnQd significantly, so Qs = exp(lnQs)
+        # must be able to reach very small values without violating variable bounds
+        qs_lb = 1e-12  # Very small to allow any lnQs value from slack
+        qd_lb = 1e-12  # Very small to allow any lnQd value from slack
+        
+        # DEBUG: Log small baseline nodes
+        if i == 'Myanmar' and j == 'Oats':
+            logging.getLogger(__name__).info(
+                "[NZF][DEBUG] Myanmar Oats %d: Q0_raw=%.2e, D0_raw=%.2e, qs_lb=%.2e, qd_lb=%.2e, Qmin=%.2e",
+                t, Q0_raw, D0_raw, qs_lb, qd_lb, Qmin)
+        
+        Qs[i, j, t] = m.addVar(lb=qs_lb, ub=q_ub, name=f"Qs[{i},{j},{t}]")
+        Qd[i, j, t] = m.addVar(lb=qd_lb, ub=Qmax, name=f"Qd[{i},{j},{t}]")
         lnQs[i, j, t] = m.addVar(lb=-gp.GRB.INFINITY, name=f"lnQs[{i},{j},{t}]")
         lnQd[i, j, t] = m.addVar(lb=-gp.GRB.INFINITY, name=f"lnQd[{i},{j},{t}]")
-        _log_pwl(m, Qs[i, j, t], lnQs[i, j, t], Qmin, Qmax, npts_log, f"logQs[{i},{j},{t}]")
-        _log_pwl(m, Qd[i, j, t], lnQd[i, j, t], Qmin, Qmax, npts_log, f"logQd[{i},{j},{t}]")
+        _log_pwl(m, Qs[i, j, t], lnQs[i, j, t], qs_lb, Qmax, npts_log, f"logQs[{i},{j},{t}]")
+        _log_pwl(m, Qd[i, j, t], lnQd[i, j, t], qd_lb, Qmax, npts_log, f"logQd[{i},{j},{t}]")
+        
+        # Create slack variables for supply/demand soft constraints
+        supply_slack_pos[i, j, t] = m.addVar(lb=0.0, name=f"s_supply_pos[{i},{j},{t}]")
+        supply_slack_neg[i, j, t] = m.addVar(lb=0.0, name=f"s_supply_neg[{i},{j},{t}]")
+        demand_slack_pos[i, j, t] = m.addVar(lb=0.0, name=f"s_demand_pos[{i},{j},{t}]")
+        demand_slack_neg[i, j, t] = m.addVar(lb=0.0, name=f"s_demand_neg[{i},{j},{t}]")
 
-        # Price linkage
+        # Price linkage (basic tau only) - NOTE: pnet2 constraint below adds MACC unit-adder w
         tau = float(getattr(n, 'tax_unit', 0.0) or 0.0)
-        m.addConstr(Pnet[i, j, t] == Pc[j, t] - tau, name=f"pnet[{i},{j},{t}]")
+        # REMOVED: m.addConstr(Pnet[i, j, t] == Pc[j, t] - tau, name=f"pnet[{i},{j},{t}]")
+        # The pnet2 constraint (line ~390) properly handles Pnet = Pc - tau - w
+        # Having both pnet and pnet2 causes infeasibility when w != 0
 
         # Calibrate alpha_s and alpha_d using baseline Q0/D0 and P0
-        # Supply with yield and temperature elasticities
-        Q0_eff = float(getattr(n, 'q0_with_ty', lambda: getattr(n, 'Q0', 0.0))())
+        # Supply with yield, temperature, and cross-price elasticities
+        # NOTE: Q0_raw and D0_raw already defined above for adaptive variable bounds
+        # Use original values for calibration (no clamping) - PWL range now extends to match
+        Q0_cal = max(1e-12, Q0_raw)  # Only prevent log(0), preserve small positive values
         P0 = float(getattr(n, 'P0', 1.0) or 1.0)
         Pnet0 = max(1e-12, P0 - tau)
         eps_s = float(getattr(n, 'eps_supply', 0.0) or 0.0)
@@ -160,33 +299,71 @@ def build_model(
         eta_temp = float(getattr(n, 'eps_supply_temp', 0.0) or 0.0)
         Ymult = float(getattr(n, 'Ymult', 1.0) or 1.0)
         Tmult = float(getattr(n, 'Tmult', 1.0) or 1.0)
-        alpha_s = math.log(max(1e-12, Q0_eff)) - eps_s * math.log(Pnet0) - eta_y * math.log(max(1e-12, Ymult)) - eta_temp * math.log(max(1e-12, Tmult))
-        cs = m.addConstr(lnQs[i, j, t] == alpha_s + eps_s * lnPnet[i, j, t] + eta_y * math.log(max(1e-12, Ymult)) + eta_temp * math.log(max(1e-12, Tmult)),
+        row_s = getattr(n, 'epsS_row', {}) or {}
+        # Baseline calibration with cross-price elasticities
+        Pnet0_by_comm = {c: max(1e-12, float(getattr(idx.get((i, c, t)), 'P0', 1.0) or 1.0) - tau) for c in commodities}
+        ln_base_s = eps_s * math.log(Pnet0) + sum(float(row_s.get(mm, 0.0)) * math.log(Pnet0_by_comm.get(mm, 1.0)) for mm in commodities)
+        alpha_s = math.log(Q0_cal) - ln_base_s - eta_y * math.log(max(1e-12, Ymult)) - eta_temp * math.log(max(1e-12, Tmult))
+        # Only include cross-price terms for commodities that exist for this country-year (after name mapping)
+        # 使用已创建的 lnPnet 变量；若对应节点尚未创建，跳过该交叉项
+        cross_price_terms = gp.quicksum(float(row_s.get(mm, 0.0)) * lnPnet[(i, mm, t)] for mm in row_s.keys() if (i, mm, t) in lnPnet)
+        # ADD SLACK: lnQs + slack_neg - slack_pos = RHS (allows deviation from predicted supply)
+        cs = m.addConstr(lnQs[i, j, t] + supply_slack_neg[i, j, t] - supply_slack_pos[i, j, t] == alpha_s + eps_s * lnPnet[i, j, t] + cross_price_terms + eta_y * math.log(max(1e-12, Ymult)) + eta_temp * math.log(max(1e-12, Tmult)),
                          name=f"supply[{i},{j},{t}]")
         constr_supply[(i, j, t)] = cs
 
-        # Demand with cross-price and population
-        D0 = float(getattr(n, 'D0', 0.0) or 0.0)
+        # Demand with cross-price and population (population/income as relative changes vs base year)
+        # NOTE: D0_raw already defined above for adaptive variable bounds
         eps_d = float(getattr(n, 'eps_demand', 0.0) or 0.0)
         eps_pop = float(getattr(n, 'eps_pop_demand', 0.0) or 0.0)
         eps_inc = float(getattr(n, 'eps_income_demand', 0.0) or 0.0)
         row = getattr(n, 'epsD_row', {}) or {}
-        # baseline ln Qd = ln D0 = alpha_d + eps_d ln(Pc0[j]) + sum_m epsD_row[m] ln(Pc0[m]) + eps_pop ln(Pop0)
         Pc0_by_comm = {c: float(getattr(n, 'P0', 1.0) or 1.0) for c in commodities}
         ln_base = eps_d * math.log(Pc0_by_comm[j]) + sum(float(row.get(mm, 0.0)) * math.log(Pc0_by_comm[mm]) for mm in commodities)
-        # Population base unknown; set Pop0=1 unless provided
-        pop0 = 1.0
-        alpha_d = math.log(max(1e-12, D0)) - ln_base - eps_pop * math.log(max(1e-12, pop0))
-        lnPop = math.log(max(1e-12, float(population_by_country_year.get((i, t), 1.0)) if population_by_country_year else 1.0))
-        lnInc = math.log(max(1e-12, float(income_mult_by_country_year.get((i, t), 1.0)) if income_mult_by_country_year else 1.0))
-        cd = m.addConstr(lnQd[i, j, t] == alpha_d + eps_d * lnPc[j, t] + gp.quicksum(float(row.get(mm, 0.0)) * lnPc[mm, t] for mm in commodities) + eps_pop * lnPop + eps_inc * lnInc,
+        # base population/income at hist_end (e.g., 2020); fallback to 1 to avoid log(0)
+        pop_base = float(population_by_country_year.get((i, hist_end), 1.0) if population_by_country_year else 1.0)
+        inc_base = float(income_mult_by_country_year.get((i, hist_end), 1.0) if income_mult_by_country_year else 1.0)
+        # NOTE: D0_raw already defined above for adaptive variable bounds
+        # Use original value for calibration (only prevent log(0)) - PWL range now extends to match
+        D0_cal = max(1e-12, D0_raw)  # Only prevent log(0), preserve small positive values
+        # FIXED: alpha_d should NOT subtract eps_pop*log(pop_base) or eps_inc*log(inc_base)
+        # because the constraint uses RELATIVE changes: lnPop = log(pop_t/pop_base), lnInc = log(inc_t/inc_base)
+        # At base year: lnPop = 0, lnInc = 0, so calibration is simply: alpha_d = log(D0) - ln_base
+        alpha_d = math.log(D0_cal) - ln_base
+        pop_t = float(population_by_country_year.get((i, t), pop_base) if population_by_country_year else pop_base)
+        inc_t = float(income_mult_by_country_year.get((i, t), inc_base) if income_mult_by_country_year else inc_base)
+        lnPop = math.log(max(1e-12, pop_t / max(1e-12, pop_base)))
+        lnInc = math.log(max(1e-12, inc_t / max(1e-12, inc_base)))
+        # ADD SLACK: lnQd + slack_neg - slack_pos = RHS (allows deviation from predicted demand)
+        cd = m.addConstr(lnQd[i, j, t] + demand_slack_neg[i, j, t] - demand_slack_pos[i, j, t] == alpha_d + eps_d * lnPc[j, t] + gp.quicksum(float(row.get(mm, 0.0)) * lnPc[mm, t] for mm in commodities) + eps_pop * lnPop + eps_inc * lnInc,
                          name=f"demand[{i},{j},{t}]")
+        if i == 'Myanmar' and j == 'Oats' and t == 2080:
+            try:
+                rhs_const = alpha_d + eps_pop * lnPop + eps_inc * lnInc
+                logging.getLogger(__name__).info(
+                    "[NZF][DEBUG] Myanmar Oats 2080 DEMAND: D0_raw=%.4e, D0_cal=%.4e, eps_d=%.4f, eps_pop=%.4f, eps_inc=%.4f, "
+                    "pop_base=%.2e, pop_t=%.2e, inc_base=%.4f, inc_t=%.4f, lnPop=%.4f, lnInc=%.4f, ln_base=%.4f, "
+                    "alpha_d=%.4f, RHS_const=%.4f",
+                    D0_raw, D0_cal, eps_d, eps_pop, eps_inc, pop_base, pop_t, inc_base, inc_t, lnPop, lnInc, ln_base, alpha_d, rhs_const)
+            except Exception:
+                pass
+        if i == 'Brazil' and j == 'Roundwood' and t == 2080:
+            try:
+                logging.getLogger(__name__).info(
+                    "[NZF][DEBUG] BR Roundwood 2080 demand: D0=%.3f eps_d=%.4f eps_pop=%.4f eps_inc=%.4f pop_base=%.3f inc_base=%.3f lnPop=%.3f lnInc=%.3f ln_base=%.3f alpha_d=%.3f RHS=%.3f",
+                    D0_raw, eps_d, eps_pop, eps_inc, pop_base, inc_base, lnPop, lnInc, ln_base, alpha_d,
+                    alpha_d + eps_d * math.log(Pc0_by_comm[j]) + eps_pop * lnPop + eps_inc * lnInc)
+            except Exception:
+                pass
         constr_demand[(i, j, t)] = cd
 
         # Emissions and MACC abatement cost
         Eij[i, j, t] = m.addVar(lb=0.0, name=f"E[{i},{j},{t}]")
         Cij[i, j, t] = m.addVar(lb=0.0, name=f"C[{i},{j},{t}]")
-        w = m.addVar(lb=0.0, ub=Pmax, name=f"w[{i},{j},{t}]")  # unit cost adder
+        # NOTE: w is unit abatement cost adder (USD/tonne product), cap at 1e+04 for numerical stability
+        # This avoids McCormick Big-M values of 1e+14 when combined with large Qs bounds
+        w_upper = 1e+04  # 10,000 USD/tonne is reasonable upper bound for marginal abatement cost
+        w = m.addVar(lb=0.0, ub=w_upper, name=f"w[{i},{j},{t}]")  # unit cost adder
         t_aux = m.addVar(lb=0.0, name=f"t[{i},{j},{t}]")      # auxiliary t = w * Qs
         Wunit[i, j, t] = w
         Taux[i, j, t] = t_aux
@@ -248,7 +425,7 @@ def build_model(
         else:
             m.addConstr(Cij[i, j, t] == 0.0, name=f"C_def[{i},{j},{t}]")
 
-        # Accumulate totals
+        # Accumulate totals: abatement cost only
         total_C += Cij[i, j, t]
         # LULUCF split for land carbon price term
         e_land = sum(float(v) for p, v in e0_map.items() if _is_lulucf_process(p))
@@ -258,25 +435,48 @@ def build_model(
         total_E_other += (sum_e0 - e_land) * Qs[i, j, t]
 
         # McCormick envelope tying unit adder to cost: t_aux = w * Qs; enforce t_aux == Cij to get w = C/Q
-        wL, wU = 0.0, Pmax
-        qL, qU = Qmin, Qmax
-        m.addConstr(t_aux >= wL * Qs[i, j, t] + qL * w - wL * qL, name=f"mc1[{i},{j},{t}]")
-        m.addConstr(t_aux >= wU * Qs[i, j, t] + qU * w - wU * qU, name=f"mc2[{i},{j},{t}]")
-        m.addConstr(t_aux <= wU * Qs[i, j, t] + qL * w - wU * qL, name=f"mc3[{i},{j},{t}]")
-        m.addConstr(t_aux <= wL * Qs[i, j, t] + qU * w - wL * qU, name=f"mc4[{i},{j},{t}]")
-        m.addConstr(t_aux == Cij[i, j, t], name=f"t_eq_C[{i},{j},{t}]")
-        # Price linkage includes unit adder
-        m.addConstr(Pnet[i, j, t] == Pc[j, t] - (tau + w), name=f"pnet2[{i},{j},{t}]")
+        # ONLY add McCormick constraints when there are cost_terms (MACC data exists)
+        # Otherwise, w=0 and no bilinear relaxation needed
+        if cost_terms:
+            # Use w_upper (not Pmax) to keep Big-M values reasonable for numerical stability
+            # NUMERICAL STABILITY FIX: Cap qU for McCormick to avoid wU*qU > 1e+10
+            # This keeps mc2/mc4 RHS values below 1e+10 instead of 1e+14
+            # The actual Qs variable still has full q_ub bound; this is just for Big-M relaxation
+            q_ub_mc = min(q_ub, 1e+06)  # Cap McCormick qU at 1e+06 to keep wU*qU = 1e+04*1e+06 = 1e+10
+            wL, wU = 0.0, w_upper
+            qL, qU = Qmin, q_ub_mc
+            m.addConstr(t_aux >= wL * Qs[i, j, t] + qL * w - wL * qL, name=f"mc1[{i},{j},{t}]")
+            m.addConstr(t_aux >= wU * Qs[i, j, t] + qU * w - wU * qU, name=f"mc2[{i},{j},{t}]")
+            m.addConstr(t_aux <= wU * Qs[i, j, t] + qL * w - wU * qL, name=f"mc3[{i},{j},{t}]")
+            m.addConstr(t_aux <= wL * Qs[i, j, t] + qU * w - wL * qU, name=f"mc4[{i},{j},{t}]")
+            m.addConstr(t_aux == Cij[i, j, t], name=f"t_eq_C[{i},{j},{t}]")
+            # Price linkage includes unit adder
+            m.addConstr(Pnet[i, j, t] == Pc[j, t] - (tau + w), name=f"pnet2[{i},{j},{t}]")
+        else:
+            # No MACC data: fix w=0, t_aux=0, simplify price linkage
+            m.addConstr(w == 0.0, name=f"w_zero[{i},{j},{t}]")
+            m.addConstr(t_aux == 0.0, name=f"t_zero[{i},{j},{t}]")
+            m.addConstr(Pnet[i, j, t] == Pc[j, t] - tau, name=f"pnet2[{i},{j},{t}]")
 
     # Market clearing per (j,t)
+    # Add slack variables to handle potential supply-demand imbalances
+    # excess: supply exceeds demand (stock accumulation)
+    # shortage: demand exceeds supply (unmet demand)
+    excess = {}
+    shortage = {}
     for j in commodities:
         for t in years:
             supply_sum = gp.quicksum(Qs[i, j, t] for i in countries if (i,j,t) in Qs)
             demand_sum = gp.quicksum(Qd[i, j, t] for i in countries if (i,j,t) in Qd)
-            m.addConstr(supply_sum + import_slack[j, t] == demand_sum + export_slack[j, t],
-                        name=f"clear[{j},{t}]")
+            # Create slack variables for supply-demand balance
+            excess[j, t] = m.addVar(lb=0.0, name=f"excess[{j},{t}]")
+            shortage[j, t] = m.addVar(lb=0.0, name=f"shortage[{j},{t}]")
+            # Market clearing with slack: supply + shortage = demand + excess + stock
+            m.addConstr(supply_sum + shortage[j, t] == demand_sum + excess[j, t] + stock[j, t], name=f"clear[{j},{t}]")
+            # Stock is bounded by excess (can't store what we don't produce)
+            m.addConstr(stock[j, t] <= excess[j, t], name=f"stock_cap[{j},{t}]")
 
-    # Nutrition constraint (future only): sum_j nutrient_per_unit[j] * Qs[i,j,t] >= RHS[i,t]
+    # Nutrition constraint (future only): sum_j nutrient_per_unit[j] * Qd[i,j,t] >= RHS[i,t]
     if nutrition_rhs and nutrient_per_unit_by_comm:
         for i in countries:
             for t in years:
@@ -287,22 +487,41 @@ def build_model(
                     continue
                 expr = gp.LinExpr(0.0)
                 for j in commodities:
-                    if (i,j,t) in Qs:
+                    if (i, j, t) in Qd:
                         v = float(nutrient_per_unit_by_comm.get(j, 0.0) or 0.0)
                         if v > 0:
-                            expr += v * Qs[i, j, t]
+                            expr += v * Qd[i, j, t]
                 if expr.size() > 0:
                     cn = m.addConstr(expr >= float(rhs), name=f"nutri[{i},{t}]")
                     nutri_constr[(i, t)] = cn
 
     # Land area upper bound per (i,t)
+    # 约束含义：耕地面积 + 草地面积 + 森林面积 ≤ 总土地上限
+    # 未来年份统一使用2020年的土地上限数据
+    # ✅ 森林面积作为基期固定值参与约束
     if land_area_limits:
+        BASE_YEAR_FOR_LAND = 2020
         for i in countries:
-            for t in years:
-                limit = land_area_limits.get((i, t))
-                if limit is None:
+            # ✅ 统一使用2020年的土地上限数据（单位: 1000 ha）
+            limit = land_area_limits.get((i, BASE_YEAR_FOR_LAND))
+            if limit is None:
+                continue
+            # ✅ 跳过 NaN 值
+            try:
+                limit_float = float(limit) * 1000.0  # 转换为 ha
+                if np.isnan(limit_float) or np.isinf(limit_float):
                     continue
-                # Use node-level yield0 if available (avg 2010-2020), otherwise default
+            except (ValueError, TypeError):
+                continue
+            
+            # ✅ 获取基期森林面积（2020年）
+            forest_area_ha = 0.0
+            if forest_area_by_country_year:
+                forest_area_ha = forest_area_by_country_year.get((i, BASE_YEAR_FOR_LAND), 0.0)
+            
+            for t in years:
+                # ✅ 关键修复：土地约束 = 耕地面积 + 草地面积 + 森林面积 <= 总土地上限
+                # 耕地面积 = Σ(Qs / yield0)
                 expr = gp.LinExpr(0.0)
                 for j in commodities:
                     if (i,j,t) not in Qs:
@@ -313,8 +532,106 @@ def build_model(
                         y0 = float(getattr(n, 'meta', {}).get('yield0', 0.0))
                     coef = 1.0 / max(1e-12, y0 if y0 and y0>0 else yield_t_per_ha_default)
                     expr += coef * Qs[i, j, t]
-                cl = m.addConstr(expr <= float(limit), name=f"landU[{i},{t}]")
-                landU_constr[(i, t)] = cl
+                
+                # ✅ 加入草地面积（从外部数据）
+                grass_area = 0.0
+                if grass_area_by_region_year:
+                    grass_area = grass_area_by_region_year.get((i, t), 0.0)
+                    if grass_area > 0:
+                        expr.addConstant(grass_area)  # 草地面积加到约束左侧
+                
+                # ✅ 加入森林面积（基期固定值）
+                if forest_area_ha > 0:
+                    expr.addConstant(forest_area_ha)  # 森林面积加到约束左侧
+                
+                if expr.size() > 0:
+                    cl = m.addConstr(expr <= limit_float, name=f"landU[{i},{t}]")
+                    landU_constr[(i, t)] = cl
+
+    # Growth rate constraints: limit change between consecutive years
+    growth_constr_upper: Dict[Tuple[str,str,int], gp.Constr] = {}
+    growth_constr_lower: Dict[Tuple[str,str,int], gp.Constr] = {}
+    if max_growth_rate_per_period is not None or max_decline_rate_per_period is not None:
+        growth_rate = max_growth_rate_per_period if max_growth_rate_per_period is not None else 0.5
+        decline_rate = max_decline_rate_per_period if max_decline_rate_per_period is not None else 0.5
+        # 历史最大产量，用于当历史变量缺失时提供锚点
+        hist_max: Dict[Tuple[str, str], float] = {}
+        for i in countries:
+            for j in commodities:
+                vals = []
+                for t in years:
+                    if t <= 2020:
+                        n_hist = idx.get((i, j, t))
+                        if n_hist:
+                            try:
+                                vals.append(float(n_hist.q0_with_ty()))
+                            except Exception:
+                                vals.append(float(getattr(n_hist, 'Q0', 0.0)))
+                if vals:
+                    hist_max[(i, j)] = max(v for v in vals if v is not None)
+        
+        for i in countries:
+            for j in commodities:
+                years_sorted = sorted([t for t in years if (i,j,t) in idx])  # use all years with nodes (even if Qs not a var)
+                for idx_t in range(1, len(years_sorted)):
+                    t_prev = years_sorted[idx_t - 1]
+                    t_curr = years_sorted[idx_t]
+                    year_diff = t_curr - t_prev
+                    
+                    n_prev = idx.get((i, j, t_prev))
+                    Q0_prev = float(getattr(n_prev, 'q0_with_ty', lambda: getattr(n_prev, 'Q0', 0.0))()) if n_prev else 0.0
+                    # 若无历史变量则使用历史最大值
+                    hist_anchor = hist_max.get((i, j), 0.0)
+                    baseline_val = Q0_prev if Q0_prev > 0 else hist_anchor
+                    
+                    # Only apply constraint if baseline production is positive
+                    if baseline_val <= 1e-3 or (i, j, t_curr) not in Qs:
+                        continue
+
+                    # Compound growth rate for multi-year periods
+                    max_mult_upper = (1.0 + growth_rate) ** year_diff
+                    max_mult_lower = (1.0 - decline_rate) ** year_diff
+
+                    if (i, j, t_prev) in Qs:
+                        # Upper bound: Qs[t] <= Qs[t-1] * (1 + growth_rate)^year_diff
+                        cg_upper = m.addConstr(
+                            Qs[i, j, t_curr] <= Qs[i, j, t_prev] * max_mult_upper,
+                            name=f"growth_upper[{i},{j},{t_curr}]"
+                        )
+                        growth_constr_upper[(i, j, t_curr)] = cg_upper
+                        
+                        # Lower bound: Qs[t] >= Qs[t-1] * (1 - growth_rate)^year_diff
+                        cg_lower = m.addConstr(
+                            Qs[i, j, t_curr] >= Qs[i, j, t_prev] * max_mult_lower,
+                            name=f"growth_lower[{i},{j},{t_curr}]"
+                        )
+                        growth_constr_lower[(i, j, t_curr)] = cg_lower
+                    else:
+                        # 历史期没有优化变量：使用历史基准锚定未来
+                        cg_upper = m.addConstr(
+                            Qs[i, j, t_curr] <= baseline_val * max_mult_upper,
+                            name=f"growth_upper_base[{i},{j},{t_curr}]"
+                        )
+                        growth_constr_upper[(i, j, t_curr)] = cg_upper
+                        cg_lower = m.addConstr(
+                            Qs[i, j, t_curr] >= baseline_val * max_mult_lower,
+                            name=f"growth_lower_base[{i},{j},{t_curr}]"
+                        )
+                        growth_constr_lower[(i, j, t_curr)] = cg_lower
+        # 对所有未来年份再叠加一次绝对上界：Qs[t] <= hist_max*(1+g)^(t-2020)
+        for (i, j), base_val in hist_max.items():
+            if base_val is None or base_val <= 1e-3:
+                continue
+            for t in years:
+                if t <= 2020 or (i, j, t) not in Qs:
+                    continue
+                year_diff = t - 2020
+                max_mult_upper = (1.0 + growth_rate) ** year_diff
+                cg_upper_abs = m.addConstr(
+                    Qs[i, j, t] <= base_val * max_mult_upper,
+                    name=f"growth_upper_abs[{i},{j},{t}]"
+                )
+                growth_constr_upper[(i, j, t, 'abs')] = cg_upper_abs
 
     # Objective: total abatement cost + land carbon price term
     obj = total_C
@@ -327,16 +644,25 @@ def build_model(
                 # Rebuild abat_land expression analogously
                 # Note: without holding references to a_by_proc outside loop, approximate benefit by cp * total_E_land already accumulated
                 obj += cp * (e_land * Qs[i, j, t])  # benefit for BAU emissions
-        # Since total_E_land already subtracts abatements, subtract cp * 危 a(LULUCF)
+        # Since total_E_land already subtracts abatements, subtract cp * Σ a(LULUCF)
         # This is approximated within per-node accumulation above.
 
-    slack_penalty = 1e-6
-    for v in import_slack.values():
-        obj += slack_penalty * v
-    for v in export_slack.values():
-        obj += slack_penalty * v
+    # Add penalty for supply-demand imbalances (excess/shortage) AND supply/demand equation slack
+    # Use a high penalty to minimize slack usage while keeping model feasible
+    SLACK_PENALTY = 1e6  # High penalty to minimize imbalances
+    for j in commodities:
+        for t in years:
+            obj += SLACK_PENALTY * (excess[j, t] + shortage[j, t])
+    
+    # Add penalty for supply/demand soft constraint violations (higher penalty = stricter adherence to log-linear equations)
+    EQUATION_SLACK_PENALTY = 1e5  # Slightly lower than market clearing slack to prioritize market equilibrium
+    for i, j, t in supply_slack_pos.keys():
+        obj += EQUATION_SLACK_PENALTY * (supply_slack_pos[i, j, t] + supply_slack_neg[i, j, t])
+        obj += EQUATION_SLACK_PENALTY * (demand_slack_pos[i, j, t] + demand_slack_neg[i, j, t])
 
+    # Set objective with slack penalties to minimize imbalances
     m.setObjective(obj, gp.GRB.MINIMIZE)
+    
     # expose cache for in-place MC updates
     m._nzf_cache = dict(
         Pc=Pc, lnPc=lnPc, Pnet=Pnet, lnPnet=lnPnet, Qs=Qs, Qd=Qd, lnQs=lnQs, lnQd=lnQd,
@@ -344,9 +670,17 @@ def build_model(
         constr_supply=constr_supply, constr_demand=constr_demand,
         constr_Edef=constr_Edef, proc_cap_constr=proc_cap_constr, proc_cap_basecoeff=proc_cap_basecoeff,
         e0_by_node=e0_by_node, nutri_constr=nutri_constr, landU_constr=landU_constr,
-        import_slack=import_slack, export_slack=export_slack,
+        growth_constr_upper=growth_constr_upper, growth_constr_lower=growth_constr_lower,
+        stock=stock, excess=excess, shortage=shortage,
+        supply_slack_pos=supply_slack_pos, supply_slack_neg=supply_slack_neg,
+        demand_slack_pos=demand_slack_pos, demand_slack_neg=demand_slack_neg,
         countries=countries, commodities=commodities, years=years,
     )
+    if lp_output_path:
+        try:
+            m.write(lp_output_path)
+        except Exception as err:
+            logging.getLogger(__name__).warning(f"Failed to write LP to {lp_output_path}: {err}")
     m.update()
 
     var = {
@@ -357,8 +691,7 @@ def build_model(
         "W": Wunit,
         "C": Cij,
         "E": Eij,
-        "Import": import_slack,
-        "Export": export_slack,
+        "Stock": stock,
     }
     return m, var
 
@@ -387,8 +720,7 @@ class ModelCache:
     W: Dict[Tuple[str,str,int], gp.Var]
     Cij: Dict[Tuple[str,str,int], gp.Var]
     Eij: Dict[Tuple[str,str,int], gp.Var]
-    ImportSlack: Dict[Tuple[str,int], gp.Var]
-    ExportSlack: Dict[Tuple[str,int], gp.Var]
+    Stock: Dict[Tuple[str,int], gp.Var]
     constr_supply: Dict[Tuple[str,str,int], gp.Constr]
     constr_demand: Dict[Tuple[str,str,int], gp.Constr]
     alpha_s: Dict[Tuple[str,str,int], float]
@@ -412,7 +744,7 @@ def build_model_cache(data: Any, **kwargs) -> ModelCache:
     Pnet = c.get('Pnet', {}); lnPnet = c.get('lnPnet', {})
     Qs = c.get('Qs', {}); Qd = c.get('Qd', {}); lnQs = c.get('lnQs', {}); lnQd = c.get('lnQd', {})
     W = c.get('W', {}); Cij = c.get('Cij', {}); Eij = c.get('Eij', {})
-    import_slack = c.get('import_slack', {}); export_slack = c.get('export_slack', {})
+    stock = c.get('stock', {})
     constr_supply = c.get('constr_supply', {}); constr_demand = c.get('constr_demand', {})
     constr_Edef = c.get('constr_Edef', {})
 
@@ -440,7 +772,7 @@ def build_model_cache(data: Any, **kwargs) -> ModelCache:
         alpha_d[key] = math.log(max(1e-12, D0))
 
     return ModelCache(m, Pc, lnPc, Pnet, lnPnet, Qs, Qd, lnQs, lnQd,
-                      W, Cij, Eij, import_slack, export_slack,
+                      W, Cij, Eij, stock,
                       constr_supply, constr_demand, alpha_s, alpha_d,
                       eps_s, eps_d, eps_pop, eta_y, eta_temp, ymult0, tmult0,
                       _builder=c)

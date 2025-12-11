@@ -3,7 +3,7 @@
 Compute 'Production Value per Unit' for World (FAOSTAT) with correct units:
 - Value: parse thousand/million/billion + currency (US$ vs I$) + basis (constant 2014–2016 vs current)
 - Per-unit = (Gross Production Value in currency units) / (Production in tonnes)
-- Output columns: Area Code, Area Code (M49), Area, Item, Element, Unit, Y2010..Y2021
+- Output columns: M49_Country_Code, Area, Item, Element, Unit, Y2010..Y2021
 - Files:
     /mnt/data/Value_of_Production_E_All_Data_NOFLAG.csv
     /mnt/data/Production_Crops_Livestock_E_All_Data_NOFLAG.csv
@@ -14,13 +14,17 @@ import pandas as pd
 import numpy as np
 import re
 
-VALUE_PATH = "../../input/Price_Cost/Price/Value_of_Production_E_All_Data_NOFLAG.csv"
-PROD_PATH  = "../../input/Production_Trade/Production_Crops_Livestock_E_All_Data_NOFLAG.csv"
-OUT_PATH   = "../../input/Price_Cost/Price/World_Production_Value_per_Unit.csv"
+VALUE_PATH = "../../input/Price_Cost/Price/Value_of_Production_E_All_Data_NOFLAG_test.csv"
+PROD_PATH  = "../../input/Production_Trade/Production_Crops_Livestock_E_All_Data_NOFLAG_yield_refilled.csv"
+OUT_PATH   = "../../input/Price_Cost/Price/World_Production_Value_per_Unit2.csv"
 
 # ---- 1) Read
 value_df = pd.read_csv(VALUE_PATH, low_memory=False)
 prod_df  = pd.read_csv(PROD_PATH,  low_memory=False)
+if 'Select' in value_df.columns:
+    value_df = value_df[pd.to_numeric(value_df['Select'], errors='coerce') == 1]
+if 'Select' in prod_df.columns:
+    prod_df = prod_df[pd.to_numeric(prod_df['Select'], errors='coerce') == 1]
 
 # ---- 2) Filter: World + required Elements
 # Value: any Element containing 'Gross Production Value' (covers constant/current USD/I$ variants)
@@ -46,7 +50,7 @@ def keep_and_numeric(df, keep_cols, years):
             out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
 
-key_cols = ["Area Code", "Area Code (M49)", "Area", "Item"]
+key_cols = ["M49_Country_Code", "Area", "Item"]
 val_keep = key_cols + ["Element", "Unit"]
 prod_keep = key_cols + ["Element", "Unit"]
 
@@ -116,16 +120,16 @@ out["Element"] = "Production Value per Unit"
 out["Unit"] = [build_output_unit(c, b) for c, b in zip(merged["_currency"], merged["_basis"])]
 
 # backfill id columns if needed
-for col in ["Area Code", "Area Code (M49)", "Area"]:
+for col in ["M49_Country_Code", "Area"]:
     if col not in out.columns and col in merged.columns:
         out[col] = merged[col]
 
-final_cols = ["Area Code", "Area Code (M49)", "Area", "Item", "Element", "Unit"] + year_cols
+final_cols = ["M49_Country_Code", "Area", "Item", "Element", "Unit"] + year_cols
 final_cols = [c for c in final_cols if c in out.columns]
 out = out[final_cols].copy()
 
 # Optional: sort
-sort_cols = [c for c in ["Area Code", "Item", "Unit"] if c in out.columns]
+sort_cols = [c for c in ["M49_Country_Code", "Item", "Unit"] if c in out.columns]
 if sort_cols:
     out = out.sort_values(sort_cols, kind="mergesort")
 

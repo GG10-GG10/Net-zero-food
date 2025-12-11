@@ -56,6 +56,7 @@ from __future__ import annotations
 import os
 import re
 from typing import Optional, List, Tuple, Dict
+import logging
 
 import numpy as np
 import xarray as xr
@@ -65,6 +66,18 @@ from config_paths import get_src_base
 # 物理/常量
 LN2 = np.log(2.0)
 TC2CO2 = 44.0 / 12.0
+
+# ===== 诊断日志辅助函数 =====
+def _log_to_model(msg: str) -> None:
+    """将诊断信息写入model.log"""
+    try:
+        log_path = os.path.join(os.getcwd(), 'model.log')
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(msg + '\n')
+    except Exception:
+        pass  # 静默失败，不影响主流程
+    # 同时输出到控制台
+    print(msg)
 
 # =========================================================
 # 1) 参数读取
@@ -87,6 +100,17 @@ def load_params_from_excel(path: str) -> dict:
     - 'tau_shift', 'enable_shift'
     - 'replace_luh2_transitions', 'replace_luh2_harvest'
     """
+    import os
+    if not os.path.exists(path):
+        print(f"[WARN] 参数文件不存在: {path}，使用默认参数")
+        return {
+            'cveg': {'forest': 150.0, 'cropland': 5.0, 'pasture': 10.0},
+            'csoil': {'forest': 80.0, 'cropland': 50.0, 'pasture': 70.0},
+            'rho_wood': 0.5,
+            'cf_wood': 0.5,
+            'pi_agb': 0.7,
+        }
+    
     sheets = pd.read_excel(path, sheet_name=None)
     cveg = sheets['cveg'].set_index('land_type')['value'].to_dict()
     csoil = sheets['csoil'].set_index('land_type')['value'].to_dict()
@@ -121,6 +145,12 @@ def load_params_from_excel(path: str) -> dict:
         # 是否用外部数据替换 LUH2 自带的驱动
         'replace_luh2_transitions': int(_get('replace_luh2_transitions', 0.0)),
         'replace_luh2_harvest': int(_get('replace_luh2_harvest', 0.0)),
+        # ✅ 森林碳汇速率（tC/ha/年），负值表示碳吸收
+        # 按森林类型区分：Tropical=-6, Temperate=-3, Boreal=-0.8 (IPCC数据)
+        'forest_c_sink_rate_Tropical': _get('forest_c_sink_rate_Tropical', -6.0),   # tC/ha/年（热带森林）
+        'forest_c_sink_rate_Temperate': _get('forest_c_sink_rate_Temperate', -3.0), # tC/ha/年（温带森林）
+        'forest_c_sink_rate_Boreal': _get('forest_c_sink_rate_Boreal', -0.8),       # tC/ha/年（寒带森林）
+        'forest_c_sink_rate_Average': _get('forest_c_sink_rate_Average', -2.5),     # tC/ha/年（全球平均）
     }
 
 # =========================================================
@@ -695,3 +725,737 @@ def run_luc_bookkeeping(
     if transitions_file and trans_ds is not ds:
         trans_ds.close()
     return emissions_df, transitions_df
+
+
+# =========================================================
+# 6) 仅计算未来年份的简化LUC排放模块（与GLE/GCE集成）
+# =========================================================
+
+def normalize_m49(val) -> str:
+    """标准化 M49 代码：格式化为'xxx（单引号+3位数字）"""
+    s = str(val).strip()
+    if s.startswith("'"):
+        s = s[1:]
+    try:
+        return f"'{int(s):03d}"  # ✅ 'xxx格式
+    except (ValueError, TypeError):
+        return f"'{s}" if not s.startswith("'") else s
+
+def run_luc_emissions_future(
+    param_excel: str,
+    luc_area_df: Optional[pd.DataFrame] = None,
+    roundwood_change_df: Optional[pd.DataFrame] = None,
+    forest_area_df: Optional[pd.DataFrame] = None,  # ✅ 森林绝对面积数据（用于Forest碳汇计算）
+    years: Optional[list] = None,
+    dict_v3_path: Optional[str] = None,
+    historical_wood_harvest_ef: Optional[Dict[str, float]] = None,
+    historical_forest_sink_ef: Optional[Dict[str, float]] = None,  # ✅ 历史森林碳汇EF (kt CO2/ha/yr)
+    use_exponential_response: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """
+    计算仅未来年份(>2020)的LUC排放，支持两种模式：
+    1. 即时转换模式（use_exponential_response=False）：碳即时释放/吸收
+    2. 指数响应模式（use_exponential_response=True）：碳随时间按τ参数衰减
+    
+    指数响应模型使用 constants 表中的参数：
+    - tau_veg: 植被碳库响应时间尺度（默认20年）
+    - tau_soil: 土壤碳库响应时间尺度（默认20年）
+    
+    参数
+    ----
+    param_excel : str
+        LUC参数Excel文件路径（含 cveg/csoil/constants 三个sheet）
+    luc_area_df : DataFrame, optional
+        土地利用面积变化数据（含cropland_ha, forest_ha, grassland_ha等，单位ha）
+    roundwood_change_df : DataFrame, optional
+        Roundwood产量数据（含roundwood_m3列）
+    forest_area_df : DataFrame, optional
+        森林绝对面积数据（用于Forest碳汇计算）
+    years : list, optional
+        要计算的年份列表
+    dict_v3_path : str, optional
+        dict_v3.xlsx路径
+    historical_wood_harvest_ef : dict, optional
+        历史木材采伐排放因子：{M49_Country_Code: kt_CO2_per_m3}
+    historical_forest_sink_ef : dict, optional
+        历史森林碳汇排放因子：{M49_Country_Code: kt_CO2_per_ha_per_yr}
+    use_exponential_response : bool
+        是否使用指数响应模型（默认True）
+    """
+    params = load_params_from_excel(param_excel)
+    
+    # ✅ 从 constants 表加载指数响应参数
+    tau_veg = params.get('tau_veg', 20.0)     # 植被碳库响应时间尺度（年）
+    tau_soil = params.get('tau_soil', 20.0)   # 土壤碳库响应时间尺度（年）
+    
+    # 计算年度响应系数（指数衰减）
+    # a = 1 - exp(-1/τ) 表示每年向稳态转移的比例
+    a_veg = 1.0 - np.exp(-1.0 / tau_veg) if use_exponential_response else 1.0
+    a_soil = 1.0 - np.exp(-1.0 / tau_soil) if use_exponential_response else 1.0
+    
+    print(f"[LUC] 使用{'指数响应' if use_exponential_response else '即时转换'}模型")
+    if use_exponential_response:
+        print(f"[LUC]   tau_veg={tau_veg:.1f}年 → a_veg={a_veg:.4f}")
+        print(f"[LUC]   tau_soil={tau_soil:.1f}年 → a_soil={a_soil:.4f}")
+    
+    # ✅ HWP池参数
+    hl_HWP = params.get('hl_HWP', {'short': 2.0, 'medium': 25.0, 'long': 35.0})
+    alloc_HWP = params.get('alloc_HWP', {'short': 0.3, 'medium': 0.2, 'long': 0.5})
+    frac_HWP = params.get('frac_HWP', 0.5)  # 进入HWP池的碳比例
+    
+    # HWP衰减率: k = ln(2) / 半衰期
+    k_HWP = {k: LN2 / hl for k, hl in hl_HWP.items()}
+    
+    print(f"[LUC] HWP池参数:")
+    print(f"[LUC]   半衰期: short={hl_HWP['short']:.0f}yr, medium={hl_HWP['medium']:.0f}yr, long={hl_HWP['long']:.0f}yr")
+    print(f"[LUC]   分配: short={alloc_HWP['short']:.1%}, medium={alloc_HWP['medium']:.1%}, long={alloc_HWP['long']:.1%}")
+    print(f"[LUC]   frac_HWP={frac_HWP:.1%} (进入HWP的碳比例)")
+    
+    # ✅ 森林碳汇速率（按类型）
+    forest_sink_rates = {
+        'Tropical': params.get('forest_c_sink_rate_Tropical', -6.0),
+        'Temperate': params.get('forest_c_sink_rate_Temperate', -3.0),
+        'Boreal': params.get('forest_c_sink_rate_Boreal', -0.8),
+    }
+    default_sink_rate = params.get('forest_c_sink_rate_Average', -2.5)
+    print(f"[LUC] 森林碳汇速率 (tC/ha/yr): Tropical={forest_sink_rates['Tropical']}, "
+          f"Temperate={forest_sink_rates['Temperate']}, Boreal={forest_sink_rates['Boreal']}, "
+          f"Default={default_sink_rate}")
+    
+    if years is None:
+        years = []
+    else:
+        years = sorted([int(y) for y in years if int(y) > 2020])
+    
+    if not years:
+        return {'future': pd.DataFrame(columns=[
+            'M49_Country_Code', 'Region_label_new', 'year', 'Process', 'GHG', 'value'
+        ])}
+    
+    # 加载国家<->M49映射 + 森林类型映射
+    m49_to_iso3 = {}
+    iso3_to_m49 = {}
+    m49_to_forest_type = {}  # ✅ 新增：M49 -> 森林类型映射
+    if dict_v3_path:
+        try:
+            region_df = pd.read_excel(dict_v3_path, sheet_name='region', 
+                                     usecols=['M49_Country_Code', 'ISO3 Code', 'Region_Forest_type'])
+            # 使用 normalize_m49 统一格式
+            region_df['M49_Country_Code'] = region_df['M49_Country_Code'].apply(normalize_m49)
+            region_df['ISO3 Code'] = region_df['ISO3 Code'].astype(str).str.strip()
+            m49_to_iso3 = dict(zip(region_df['M49_Country_Code'], region_df['ISO3 Code']))
+            iso3_to_m49 = dict(zip(region_df['ISO3 Code'], region_df['M49_Country_Code']))
+            
+            # ✅ 加载森林类型映射
+            region_df['Region_Forest_type'] = region_df['Region_Forest_type'].fillna('').astype(str).str.strip()
+            m49_to_forest_type = dict(zip(region_df['M49_Country_Code'], region_df['Region_Forest_type']))
+            # 统计森林类型分布
+            forest_type_counts = region_df['Region_Forest_type'].value_counts().to_dict()
+            print(f"[LUC] 森林类型分布: {forest_type_counts}")
+        except Exception as e:
+            print(f"[WARN] 无法加载dict_v3中的M49/森林类型映射: {e}")
+    
+    records = []
+    
+    # ✅ HWP池状态：{m49: {short: tC, medium: tC, long: tC}}
+    # 用于跟踪每个国家的HWP池碳库存
+    hwp_pools: Dict[str, Dict[str, float]] = {}
+    
+    def get_hwp_pool(m49: str) -> Dict[str, float]:
+        if m49 not in hwp_pools:
+            hwp_pools[m49] = {'short': 0.0, 'medium': 0.0, 'long': 0.0}
+        return hwp_pools[m49]
+    
+    # ===== 处理土地利用面积驱动 =====
+    if luc_area_df is not None and not luc_area_df.empty:
+        df_luc = luc_area_df.copy()
+        df_luc.columns = [str(c).strip() for c in df_luc.columns]
+        
+        # 识别年份列
+        year_col = next((c for c in df_luc.columns if 'year' in c.lower()), 'year')
+        df_luc = df_luc.rename(columns={year_col: 'year'})
+        
+        # 确保M49_Country_Code列存在
+        if 'M49_Country_Code' not in df_luc.columns:
+            # 尝试从其他国家列识别
+            country_col = next((c for c in df_luc.columns if 'country' in c.lower()), None)
+            if country_col:
+                # 假设是ISO3，尝试映射到M49
+                df_luc['M49_Country_Code'] = df_luc[country_col].apply(
+                    lambda x: iso3_to_m49.get(str(x).strip(), str(x).strip())
+                )
+            else:
+                print("[WARN] luc_area_df中无法识别国家标识")
+                df_luc['M49_Country_Code'] = 'UNK'
+        
+        # 确保M49_Country_Code为标准化字符串
+        df_luc['M49_Country_Code'] = df_luc['M49_Country_Code'].apply(normalize_m49)
+        
+        # 过滤年份
+        df_luc = df_luc[df_luc['year'].astype(int) > 2020]
+        
+        # ✅ DEBUG: 打印输入数据统计
+        print(f"[LUC DEBUG] 未来年份LUC面积变化数据: {len(df_luc)} 行")
+        # 标准化列名：移除'd_'前缀（如果存在）
+        rename_map = {}
+        if 'd_cropland_ha' in df_luc.columns and 'cropland_ha' not in df_luc.columns:
+            rename_map['d_cropland_ha'] = 'cropland_ha'
+        if 'd_grassland_ha' in df_luc.columns and 'grassland_ha' not in df_luc.columns:
+            rename_map['d_grassland_ha'] = 'grassland_ha'
+        if 'd_forest_ha' in df_luc.columns and 'forest_ha' not in df_luc.columns:
+            rename_map['d_forest_ha'] = 'forest_ha'
+        
+        if rename_map:
+            df_luc = df_luc.rename(columns=rename_map)
+            print(f"[LUC DEBUG] 列名标准化: {rename_map}")
+        
+        if not df_luc.empty:
+            print(f"[LUC DEBUG] 列名: {list(df_luc.columns)}")
+            for yr in df_luc['year'].unique():
+                yr_data = df_luc[df_luc['year'] == yr]
+                d_crop_sum = yr_data['cropland_ha'].sum() if 'cropland_ha' in yr_data.columns else 0
+                d_grass_sum = yr_data['grassland_ha'].sum() if 'grassland_ha' in yr_data.columns else 0
+                d_forest_sum = yr_data['forest_ha'].sum() if 'forest_ha' in yr_data.columns else 0
+                print(f"[LUC DEBUG] {yr}年全球汇总: d_cropland={d_crop_sum:,.0f} ha, d_grassland={d_grass_sum:,.0f} ha, d_forest={d_forest_sum:,.0f} ha")
+        
+        if not df_luc.empty:
+            # ✅ DEBUG: 统计输入数据
+            emis_debug_stats = {}
+            
+            # 碳密度参数 (tC/ha) - 从 cveg/csoil 表读取
+            forest_c_ha = params['cveg'].get('forest', 150.0)       # tC/ha 植被
+            cropland_c_ha = params['cveg'].get('cropland', 5.0)     # tC/ha 植被
+            pasture_c_ha = params['cveg'].get('pasture', 10.0)      # tC/ha 植被
+            
+            forest_soil_c_ha = params['csoil'].get('forest', 80.0)   # tC/ha 土壤
+            cropland_soil_c_ha = params['csoil'].get('cropland', 50.0)
+            pasture_soil_c_ha = params['csoil'].get('pasture', 70.0)
+            
+            # ===== 诊断日志：碳密度参数 =====
+            _log_to_model(f"\n[LUC诊断] 碳密度参数 (tC/ha):")
+            _log_to_model(f"  植被层: 森林={forest_c_ha:.1f}, 耕地={cropland_c_ha:.1f}, 草地={pasture_c_ha:.1f}")
+            _log_to_model(f"  土壤层: 森林={forest_soil_c_ha:.1f}, 耕地={cropland_soil_c_ha:.1f}, 草地={pasture_soil_c_ha:.1f}")
+            _log_to_model(f"  碳密度差(森林→耕地): 植被={forest_c_ha-cropland_c_ha:.1f}, 土壤={forest_soil_c_ha-cropland_soil_c_ha:.1f} tC/ha")
+            _log_to_model(f"  响应系数: a_veg={a_veg:.4f} ({a_veg*100:.2f}%/年), a_soil={a_soil:.4f} ({a_soil*100:.2f}%/年)")
+            
+            # ✅ 指数响应模型：维护每个国家的碳库待释放/待吸收池
+            # 结构: {m49: {'veg_crop': float, 'soil_crop': float, 'veg_pasture': float, 'soil_pasture': float}}
+            # 正值=待释放（毁林），负值=待吸收（造林）
+            carbon_pools: Dict[str, Dict[str, float]] = {}
+            
+            def get_pool(m49: str) -> Dict[str, float]:
+                if m49 not in carbon_pools:
+                    carbon_pools[m49] = {
+                        'veg_crop': 0.0, 'soil_crop': 0.0,
+                        'veg_pasture': 0.0, 'soil_pasture': 0.0
+                    }
+                return carbon_pools[m49]
+            
+            # 按年份排序处理（确保碳库状态正确累积）
+            years_in_data = sorted(df_luc['year'].unique())
+            
+            # ===== 诊断日志：初始化年度统计结构 =====
+            _log_to_model(f"\n[LUC诊断] 开始处理 {len(years_in_data)} 个年份: {years_in_data}")
+            
+            for year_val in years_in_data:
+                year_data = df_luc[df_luc['year'] == year_val]
+                
+                if year_val not in emis_debug_stats:
+                    emis_debug_stats[year_val] = {
+                        'd_cropland_sum': 0, 'd_forest_sum': 0, 
+                        'emis_crop_sum': 0, 'emis_pasture_sum': 0, 'count': 0,
+                        # 新增：碳库累积统计
+                        'pool_veg_crop_total': 0, 'pool_soil_crop_total': 0,
+                        'pool_veg_pasture_total': 0, 'pool_soil_pasture_total': 0,
+                        # 新增：排放组分
+                        'emit_veg_crop': 0, 'emit_soil_crop': 0,
+                        'emit_veg_pasture': 0, 'emit_soil_pasture': 0
+                    }
+                
+                for _, row in year_data.iterrows():
+                    m49 = str(row['M49_Country_Code']).strip()
+                    
+                    # ✅ 这些值是面积变化量(delta)，单位: ha
+                    # 使用pd.isna处理NaN值
+                    import pandas as pd
+                    d_cropland = 0.0 if pd.isna(row.get('cropland_ha')) else float(row.get('cropland_ha', 0.0))
+                    d_forest = 0.0 if pd.isna(row.get('forest_ha')) else float(row.get('forest_ha', 0.0))
+                    
+                    # 优先使用grassland_ha，如果不存在则用pasture_ha
+                    grass_val = row.get('grassland_ha', row.get('pasture_ha', 0.0))
+                    d_pasture = 0.0 if pd.isna(grass_val) else float(grass_val)
+                    
+                    emis_debug_stats[year_val]['d_cropland_sum'] += d_cropland
+                    emis_debug_stats[year_val]['d_forest_sum'] += d_forest
+                    emis_debug_stats[year_val]['d_pasture_sum'] = emis_debug_stats[year_val].get('d_pasture_sum', 0) + d_pasture
+                    emis_debug_stats[year_val]['count'] += 1
+                    
+                    # ✅ DEBUG: 以美国(M49='840')为例打印草地变化
+                    if m49 in ['840', "'840"]:
+                        print(f"[LUC FUTURE DEBUG] {year_val}年 U.S. (M49={m49}): d_cropland={d_cropland:,.0f}, d_pasture={d_pasture:,.0f}, d_forest={d_forest:,.0f} ha")
+                    
+                    pool = get_pool(m49)
+                    
+                    # ========== De/Reforestation_crop 计算 ==========
+                    if abs(d_cropland) > 0:
+                        # 碳密度差（tC/ha）= 森林碳 - 耕地碳
+                        delta_veg_c = (forest_c_ha - cropland_c_ha) * d_cropland      # tC
+                        delta_soil_c = (forest_soil_c_ha - cropland_soil_c_ha) * d_cropland  # tC
+                        
+                        # 添加到碳库池（正值=毁林待释放，负值=造林待吸收）
+                        pool['veg_crop'] += delta_veg_c
+                        pool['soil_crop'] += delta_soil_c
+                    
+                    # ========== De/Reforestation_pasture 计算 ==========
+                    if abs(d_pasture) > 0:
+                        delta_veg_p = (forest_c_ha - pasture_c_ha) * d_pasture
+                        delta_soil_p = (forest_soil_c_ha - pasture_soil_c_ha) * d_pasture
+                        
+                        pool['veg_pasture'] += delta_veg_p
+                        pool['soil_pasture'] += delta_soil_p
+                    
+                    # ========== 指数响应：本年释放/吸收的碳 ==========
+                    # 使用指数衰减模型：本年排放 = 碳库 × a（响应系数）
+                    # 排放后碳库减少: 碳库 = 碳库 × (1 - a)
+                    
+                    # Crop转换的排放
+                    emit_veg_crop = pool['veg_crop'] * a_veg      # tC
+                    emit_soil_crop = pool['soil_crop'] * a_soil   # tC
+                    total_emit_crop = (emit_veg_crop + emit_soil_crop) * TC2CO2 / 1000.0  # kt CO2
+                    
+                    # 更新碳库（剩余部分）
+                    pool['veg_crop'] -= emit_veg_crop
+                    pool['soil_crop'] -= emit_soil_crop
+                    
+                    # ===== 诊断日志：记录碳库和排放组分 =====
+                    emis_debug_stats[year_val]['pool_veg_crop_total'] += pool['veg_crop']
+                    emis_debug_stats[year_val]['pool_soil_crop_total'] += pool['soil_crop']
+                    emis_debug_stats[year_val]['emit_veg_crop'] += emit_veg_crop * TC2CO2 / 1000.0
+                    emis_debug_stats[year_val]['emit_soil_crop'] += emit_soil_crop * TC2CO2 / 1000.0
+                    
+                    if abs(total_emit_crop) > 0.001:  # 忽略极小值
+                        emis_debug_stats[year_val]['emis_crop_sum'] += total_emit_crop
+                        records.append({
+                            'M49_Country_Code': m49,
+                            'year': year_val,
+                            'Process': 'De/Reforestation_crop',
+                            'Item': 'De/Reforestation_crop area',
+                            'GHG': 'CO2',
+                            'value': total_emit_crop,  # 正值=毁林排放，负值=造林碳汇
+                        })
+                    
+                    # Pasture转换的排放
+                    emit_veg_pasture = pool['veg_pasture'] * a_veg
+                    emit_soil_pasture = pool['soil_pasture'] * a_soil
+                    total_emit_pasture = (emit_veg_pasture + emit_soil_pasture) * TC2CO2 / 1000.0
+                    
+                    pool['veg_pasture'] -= emit_veg_pasture
+                    pool['soil_pasture'] -= emit_soil_pasture
+                    
+                    # ===== 诊断日志：记录碳库和排放组分 =====
+                    emis_debug_stats[year_val]['pool_veg_pasture_total'] += pool['veg_pasture']
+                    emis_debug_stats[year_val]['pool_soil_pasture_total'] += pool['soil_pasture']
+                    emis_debug_stats[year_val]['emit_veg_pasture'] += emit_veg_pasture * TC2CO2 / 1000.0
+                    emis_debug_stats[year_val]['emit_soil_pasture'] += emit_soil_pasture * TC2CO2 / 1000.0
+                    
+                    if abs(total_emit_pasture) > 0.001:
+                        emis_debug_stats[year_val]['emis_pasture_sum'] += total_emit_pasture
+                        records.append({
+                            'M49_Country_Code': m49,
+                            'year': year_val,
+                            'Process': 'De/Reforestation_pasture',
+                            'Item': 'De/Reforestation_pasture area',
+                            'GHG': 'CO2',
+                            'value': total_emit_pasture,
+                        })
+                    
+                    # ========== Forest 过程（校验用，不重复计算碳） ==========
+                    # 这里只记录森林面积变化，排放已在上面计算
+                    # 不再重复计算，仅作为辅助信息
+            
+            # ===== 诊断日志：每年详细统计（写入model.log） =====
+            _log_to_model("\n" + "="*100)
+            _log_to_model("[De/Reforestation_crop 诊断报告] 年度排放与碳库状态")
+            _log_to_model("="*100)
+            
+            for yr, stats in sorted(emis_debug_stats.items()):
+                emis_pasture = stats.get('emis_pasture_sum', 0)
+                d_pasture = stats.get('d_pasture_sum', 0)
+                
+                # 碳库状态
+                pool_veg_crop = stats.get('pool_veg_crop_total', 0)
+                pool_soil_crop = stats.get('pool_soil_crop_total', 0)
+                pool_veg_pasture = stats.get('pool_veg_pasture_total', 0)
+                pool_soil_pasture = stats.get('pool_soil_pasture_total', 0)
+                
+                # 排放组分
+                emit_veg_crop = stats.get('emit_veg_crop', 0)
+                emit_soil_crop = stats.get('emit_soil_crop', 0)
+                emit_veg_pasture = stats.get('emit_veg_pasture', 0)
+                emit_soil_pasture = stats.get('emit_soil_pasture', 0)
+                
+                _log_to_model(f"\n[{yr}年] 国家数={stats['count']}")
+                _log_to_model(f"  面积变化(全球汇总):")
+                _log_to_model(f"    耕地: {stats['d_cropland_sum']:>15,.0f} ha")
+                _log_to_model(f"    草地: {d_pasture:>15,.0f} ha")
+                _log_to_model(f"    森林: {stats['d_forest_sum']:>15,.0f} ha")
+                _log_to_model(f"  碳库状态(待释放/吸收, kt CO2):")
+                _log_to_model(f"    Crop-植被池: {pool_veg_crop:>12,.0f}  |  Crop-土壤池: {pool_soil_crop:>12,.0f}")
+                _log_to_model(f"    Pasture-植被池: {pool_veg_pasture:>12,.0f}  |  Pasture-土壤池: {pool_soil_pasture:>12,.0f}")
+                _log_to_model(f"  本年排放组分(kt CO2):")
+                _log_to_model(f"    Crop-植被排放: {emit_veg_crop:>12,.0f}  |  Crop-土壤排放: {emit_soil_crop:>12,.0f}")
+                _log_to_model(f"    Pasture-植被排放: {emit_veg_pasture:>12,.0f}  |  Pasture-土壤排放: {emit_soil_pasture:>12,.0f}")
+                _log_to_model(f"  总排放(kt CO2):")
+                _log_to_model(f"    De/Reforestation_crop: {stats['emis_crop_sum']:>15,.0f}")
+                _log_to_model(f"    De/Reforestation_pasture: {emis_pasture:>15,.0f}")
+                _log_to_model(f"    合计: {stats['emis_crop_sum'] + emis_pasture:>15,.0f}")
+            
+            # ===== 诊断日志：碳库剩余状态与关键指标分析 =====
+            if use_exponential_response:
+                total_remaining_veg = sum(abs(p['veg_crop']) + abs(p['veg_pasture']) for p in carbon_pools.values())
+                total_remaining_soil = sum(abs(p['soil_crop']) + abs(p['soil_pasture']) for p in carbon_pools.values())
+                total_remaining_kt_co2 = (total_remaining_veg + total_remaining_soil) * TC2CO2 / 1000.0
+                
+                _log_to_model("\n" + "="*100)
+                _log_to_model("[碳库剩余状态] 指数响应模型累积效应")
+                _log_to_model("="*100)
+                _log_to_model(f"  全球碳库剩余(待释放/吸收):")
+                _log_to_model(f"    植被池: {total_remaining_veg:>15,.0f} tC ({total_remaining_veg * TC2CO2 / 1000:>12,.0f} kt CO2)")
+                _log_to_model(f"    土壤池: {total_remaining_soil:>15,.0f} tC ({total_remaining_soil * TC2CO2 / 1000:>12,.0f} kt CO2)")
+                _log_to_model(f"    合计:   {total_remaining_veg + total_remaining_soil:>15,.0f} tC ({total_remaining_kt_co2:>12,.0f} kt CO2)")
+                _log_to_model(f"\n  说明: 碳库剩余表示尚未释放完的历史毁林碳，未来年份将继续释放")
+            
+            # ===== 诊断日志：排放倍增分析 =====
+            if len(emis_debug_stats) >= 2:
+                years_sorted = sorted(emis_debug_stats.keys())
+                first_year = years_sorted[0]
+                last_year = years_sorted[-1]
+                
+                first_emis = emis_debug_stats[first_year]['emis_crop_sum']
+                last_emis = emis_debug_stats[last_year]['emis_crop_sum']
+                
+                if first_emis > 0:
+                    ratio = last_emis / first_emis
+                    _log_to_model("\n" + "="*100)
+                    _log_to_model("[排放倍增分析] De/Reforestation_crop")
+                    _log_to_model("="*100)
+                    _log_to_model(f"  基准年份({first_year}): {first_emis:>15,.0f} kt CO2")
+                    _log_to_model(f"  目标年份({last_year}): {last_emis:>15,.0f} kt CO2")
+                    _log_to_model(f"  倍增比率: {ratio:>15.2f}x")
+                    _log_to_model(f"\n  解释:")
+                    if ratio > 5:
+                        _log_to_model(f"    ⚠️ 排放显著增长! 可能原因:")
+                        _log_to_model(f"       1. 毁林速率加速（检查d_cropland面积变化趋势）")
+                        _log_to_model(f"       2. 碳库持续累积效应（指数响应模型特性）")
+                        _log_to_model(f"       3. 基准年数据异常（检查{first_year}年输入数据）")
+                    elif ratio > 2:
+                        _log_to_model(f"    ✓ 排放增长在合理范围内（碳库累积效应）")
+                    else:
+                        _log_to_model(f"    ✓ 排放基本稳定或减少")
+            
+            _log_to_model("\n" + "="*100)
+    
+    # ===== 处理木材采伐驱动 - 完整HWP池模型 =====
+    # HWP池模型：采伐碳按frac_HWP进入三个产品池（short/medium/long），其余即时排放
+    # 每年池中碳按指数衰减排放: emit = pool × (1 - exp(-k))
+    if roundwood_change_df is not None and not roundwood_change_df.empty:
+        df_rw = roundwood_change_df.copy()
+        df_rw.columns = [str(c).strip() for c in df_rw.columns]
+        
+        # 确保M49_Country_Code列存在
+        if 'M49_Country_Code' not in df_rw.columns:
+            # 尝试从其他国家列识别
+            if 'iso3' in df_rw.columns:
+                # 假设iso3列存在，映射到M49
+                df_rw['M49_Country_Code'] = df_rw['iso3'].apply(
+                    lambda x: iso3_to_m49.get(str(x).strip(), str(x).strip())
+                )
+            elif 'country' in df_rw.columns:
+                df_rw['M49_Country_Code'] = df_rw['country'].apply(
+                    lambda x: iso3_to_m49.get(str(x).strip(), str(x).strip())
+                )
+            else:
+                print("[WARN] roundwood_change_df中无法识别国家标识")
+                df_rw['M49_Country_Code'] = 'UNK'
+        
+        # 确保M49_Country_Code为标准化字符串
+        df_rw['M49_Country_Code'] = df_rw['M49_Country_Code'].apply(normalize_m49)
+        
+        df_rw = df_rw[df_rw['year'].astype(int) > 2020]
+        
+        if not df_rw.empty:
+            # Wood harvest参数
+            rho = params.get('rho_wood', 0.5)       # tDM/m³
+            cf = params.get('cf_wood', 0.5)         # tC/tDM
+            pi_agb = params.get('pi_agb', 0.7)      # AGB份额
+            
+            use_hist_ef = historical_wood_harvest_ef is not None and len(historical_wood_harvest_ef) > 0
+            if use_hist_ef:
+                print(f"[INFO] 使用历史排放因子计算未来Wood harvest (共{len(historical_wood_harvest_ef)}个国家)")
+            else:
+                print(f"[INFO] 使用理论公式计算Wood harvest (rho={rho}, cf={cf}, pi_agb={pi_agb})")
+            
+            print(f"[LUC] HWP池模型: frac_HWP={frac_HWP:.1%}进入产品池, {1-frac_HWP:.1%}即时排放")
+            
+            # 按年份排序处理（HWP池需要状态累积）
+            years_in_rw = sorted(df_rw['year'].unique())
+            hwp_emit_total = 0.0
+            inst_emit_total = 0.0
+            
+            for year_val in years_in_rw:
+                year_data = df_rw[df_rw['year'] == year_val]
+                year_hwp_emit = 0.0
+                year_inst_emit = 0.0
+                
+                for _, row in year_data.iterrows():
+                    m49 = str(row['M49_Country_Code']).strip()
+                    roundwood_m3 = float(row.get('roundwood_m3', 0.0))
+                    
+                    if roundwood_m3 > 0:
+                        # 计算排放 - 两种模式
+                        if use_hist_ef and historical_wood_harvest_ef and m49 in historical_wood_harvest_ef:
+                            # ===== 历史EF模式 =====
+                            # 历史EF = 历史排放(kt CO2) / 历史产量(m³)
+                            # 这个EF已经隐含了实际的排放模式，不需要再进行HWP分割
+                            # 直接用: 未来产量 × EF = 未来排放
+                            ef_kt_per_m3 = historical_wood_harvest_ef[m49]
+                            instant_emit_kt = roundwood_m3 * ef_kt_per_m3  # 直接得到kt CO2
+                            year_inst_emit += instant_emit_kt
+                            # 注意：历史EF模式下不计算HWP池（因为EF已包含完整排放模式）
+                        else:
+                            # ===== 理论公式模式 =====
+                            # 需要进行HWP池分割
+                            # 理论公式: m³ × tDM/m³ × tC/tDM × AGB比例 = tC
+                            harvested_tc = roundwood_m3 * rho * cf * pi_agb
+                            
+                            # 一部分进入HWP池，一部分即时排放
+                            to_hwp_tc = harvested_tc * frac_HWP        # 进入产品池的碳
+                            instant_tc = harvested_tc * (1 - frac_HWP) # 即时排放的碳
+                            
+                            # 将to_hwp_tc分配到三个池
+                            hwp_pool = get_hwp_pool(m49)
+                            for pool_name, alloc_ratio in alloc_HWP.items():
+                                hwp_pool[pool_name] += to_hwp_tc * alloc_ratio
+                            
+                            # 即时排放 (tC → kt CO2)
+                            inst_emit_kt = instant_tc * TC2CO2 / 1000.0
+                            year_inst_emit += inst_emit_kt
+                
+                # ===== HWP池衰减排放 =====
+                # 所有国家的HWP池衰减（每年处理一次）
+                # ✅ 关键修复：HWP池排放合并到Wood harvest Process，不单独列为HWP decay
+                hwp_by_country = {}  # 存储每个国家的HWP池排放
+                for m49, hwp_pool in hwp_pools.items():
+                    hwp_emit_m49 = 0.0
+                    for pool_name in ['short', 'medium', 'long']:
+                        # 本年排放 = 池量 × (1 - exp(-k))
+                        k = k_HWP[pool_name]
+                        pool_val = hwp_pool[pool_name]
+                        emit_tc = pool_val * (1 - np.exp(-k))
+                        hwp_pool[pool_name] -= emit_tc  # 更新池量
+                        hwp_emit_m49 += emit_tc
+                    
+                    if hwp_emit_m49 > 0.001:  # tC
+                        hwp_emit_kt = hwp_emit_m49 * TC2CO2 / 1000.0  # kt CO2
+                        year_hwp_emit += hwp_emit_kt
+                        hwp_by_country[m49] = hwp_emit_kt  # 暂存，稍后合并到Wood harvest
+                
+                # ✅ 关键修复：记录Wood harvest（即时排放 + HWP池排放）
+                # 先收集所有国家的即时排放
+                instant_by_country = {}
+                for _, row in year_data.iterrows():
+                    m49 = str(row['M49_Country_Code']).strip()
+                    roundwood_m3 = float(row.get('roundwood_m3', 0.0))
+                    
+                    if roundwood_m3 > 0:
+                        # 计算该国家的排放 - 与上面的逻辑保持一致
+                        if use_hist_ef and historical_wood_harvest_ef and m49 in historical_wood_harvest_ef:
+                            # 历史EF模式：直接用EF计算排放
+                            ef_kt_per_m3 = historical_wood_harvest_ef[m49]
+                            instant_kt = roundwood_m3 * ef_kt_per_m3  # 直接得到kt CO2
+                        else:
+                            # 理论公式模式：需要HWP分割
+                            harvested_tc = roundwood_m3 * rho * cf * pi_agb
+                            instant_kt = harvested_tc * (1 - frac_HWP) * TC2CO2 / 1000.0
+                        
+                        if instant_kt > 0.001:
+                            instant_by_country[m49] = instant_kt
+                
+                # 合并即时排放和HWP池排放，统一记录为Wood harvest
+                all_countries = set(instant_by_country.keys()) | set(hwp_by_country.keys())
+                for m49 in all_countries:
+                    instant_kt = instant_by_country.get(m49, 0.0)
+                    hwp_kt = hwp_by_country.get(m49, 0.0)
+                    total_kt = instant_kt + hwp_kt
+                    
+                    if total_kt > 0.001:
+                        records.append({
+                            'M49_Country_Code': m49,
+                            'year': year_val,
+                            'Process': 'Wood harvest',  # 即时排放 + HWP池排放
+                            'Item': 'Roundwood',
+                            'GHG': 'CO2',
+                            'value': total_kt,
+                        })
+                
+                hwp_emit_total += year_hwp_emit
+                inst_emit_total += year_inst_emit
+                print(f"[LUC] {year_val}年 Wood harvest: 即时排放={year_inst_emit:,.0f} kt, HWP池排放={year_hwp_emit:,.0f} kt")
+            
+            # 打印HWP池剩余量
+            total_hwp_remaining = sum(sum(p.values()) for p in hwp_pools.values())
+            print(f"[LUC] HWP池最终剩余: {total_hwp_remaining:,.0f} tC (将在后续年份继续释放)")
+    
+    # ===== 处理森林碳汇（Forest process）- 按国家森林类型匹配碳汇速率 =====
+    # Forest 碳汇表示现有森林每年吸收的碳（负排放）
+    # 计算公式: 森林面积(ha) × 碳汇速率(tC/ha/年) × 44/12 / 1000 = kt CO2/年
+    
+    if forest_area_df is not None and not forest_area_df.empty:
+        df_forest = forest_area_df.copy()
+        df_forest.columns = [str(c).strip() for c in df_forest.columns]
+        
+        # 确保M49_Country_Code列存在
+        if 'M49_Country_Code' not in df_forest.columns:
+            if 'iso3' in df_forest.columns:
+                df_forest['M49_Country_Code'] = df_forest['iso3'].apply(
+                    lambda x: iso3_to_m49.get(str(x).strip(), str(x).strip())
+                )
+            elif 'country' in df_forest.columns:
+                df_forest['M49_Country_Code'] = df_forest['country'].apply(
+                    lambda x: iso3_to_m49.get(str(x).strip(), str(x).strip())
+                )
+            else:
+                print("[WARN] forest_area_df中无法识别国家标识")
+                df_forest['M49_Country_Code'] = 'UNK'
+        
+        df_forest['M49_Country_Code'] = df_forest['M49_Country_Code'].apply(normalize_m49)
+        
+        # 过滤未来年份
+        if 'year' in df_forest.columns:
+            df_forest = df_forest[df_forest['year'].astype(int) > 2020]
+        
+        if not df_forest.empty:
+            # 识别森林面积列
+            forest_col = None
+            for col_name in ['forest_ha', 'forest_area_ha', 'forestland_ha', 'forest']:
+                if col_name in df_forest.columns:
+                    forest_col = col_name
+                    break
+            
+            if forest_col:
+                use_hist_sink_ef = historical_forest_sink_ef is not None and len(historical_forest_sink_ef) > 0
+                if use_hist_sink_ef:
+                    print(f"[INFO] 使用历史排放因子计算未来Forest碳汇 (共{len(historical_forest_sink_ef)}个国家)")
+                    # ✅ DEBUG: 打印历史EF样本
+                    sample_efs = list(historical_forest_sink_ef.items())[:5]
+                    print(f"[DEBUG] 历史Forest EF样本: {sample_efs}")
+                else:
+                    print(f"[INFO] 按国家森林类型计算Forest碳汇:")
+                    print(f"[INFO]   Tropical={forest_sink_rates['Tropical']}, Temperate={forest_sink_rates['Temperate']}, "
+                          f"Boreal={forest_sink_rates['Boreal']}, Default={default_sink_rate} tC/ha/yr")
+                
+                # 统计各类型使用情况
+                forest_type_usage = {'Tropical': 0, 'Temperate': 0, 'Boreal': 0, 'Default': 0, 'HistEF': 0}
+                total_forest_area = 0
+                total_forest_area_hist_ef = 0  # ✅ 使用历史EF的面积
+                total_forest_area_default = 0  # ✅ 使用默认速率的面积
+                unmatched_m49s = set()  # ✅ 调试：记录未匹配的M49
+                total_sink_hist_ef = 0  # ✅ 历史EF计算的碳汇
+                total_sink_default = 0  # ✅ 默认速率计算的碳汇
+                
+                for _, row in df_forest.iterrows():
+                    year_val = int(row['year'])
+                    m49 = str(row['M49_Country_Code']).strip()
+                    forest_area = float(row.get(forest_col, 0.0))
+                    
+                    if forest_area > 0:
+                        total_forest_area += forest_area
+                        
+                        # 优先使用历史排放因子
+                        if use_hist_sink_ef and historical_forest_sink_ef and m49 in historical_forest_sink_ef:
+                            # 历史EF单位: kt CO2/ha/年
+                            ef_kt_per_ha = historical_forest_sink_ef[m49]
+                            forest_sink_kt = forest_area * ef_kt_per_ha
+                            forest_type_usage['HistEF'] += 1
+                            total_forest_area_hist_ef += forest_area
+                            total_sink_hist_ef += forest_sink_kt
+                        else:
+                            # ✅ 调试：记录未匹配的M49
+                            if use_hist_sink_ef and historical_forest_sink_ef:
+                                unmatched_m49s.add(m49)
+                            # ✅ 按国家森林类型选择碳汇速率
+                            forest_type = m49_to_forest_type.get(m49, '')
+                            if forest_type in forest_sink_rates:
+                                sink_rate = forest_sink_rates[forest_type]
+                                forest_type_usage[forest_type] += 1
+                            else:
+                                sink_rate = default_sink_rate
+                                forest_type_usage['Default'] += 1
+                            
+                            # 理论公式: ha × tC/ha/年 × 44/12 / 1000 = kt CO2/年
+                            forest_sink_kt = forest_area * sink_rate * TC2CO2 / 1000.0
+                            total_forest_area_default += forest_area
+                            total_sink_default += forest_sink_kt
+                        
+                        # 森林碳汇是负值（吸收CO2）
+                        records.append({
+                            'M49_Country_Code': m49,
+                            'year': year_val,
+                            'Process': 'Forest',
+                            'Item': 'Forestland',
+                            'GHG': 'CO2',
+                            'value': forest_sink_kt,  # 负值表示碳汇
+                        })
+                
+                # 打印森林类型使用统计
+                print(f"[LUC] 森林类型使用统计: {forest_type_usage}")
+                print(f"[LUC] 总森林面积(所有年份累计): {total_forest_area:,.0f} ha")
+                print(f"[LUC]   其中: 使用历史EF={total_forest_area_hist_ef:,.0f} ha, 使用默认速率={total_forest_area_default:,.0f} ha")
+                print(f"[LUC] 碳汇分解: 历史EF={total_sink_hist_ef:,.0f} kt, 默认速率={total_sink_default:,.0f} kt")
+                
+                # ✅ DEBUG: 打印M49匹配情况
+                if use_hist_sink_ef and historical_forest_sink_ef and unmatched_m49s:
+                    print(f"[LUC DEBUG] 未匹配历史EF的M49数量: {len(unmatched_m49s)}")
+                    hist_ef_m49s = set(historical_forest_sink_ef.keys())
+                    print(f"[LUC DEBUG] 历史EF M49样本: {list(hist_ef_m49s)[:5]}")
+                    print(f"[LUC DEBUG] 未匹配M49样本: {list(unmatched_m49s)[:5]}")
+                
+                # DEBUG: 打印森林碳汇统计
+                forest_records = [r for r in records if r['Process'] == 'Forest']
+                if forest_records:
+                    total_sink = sum(r['value'] for r in forest_records)
+                    print(f"[LUC] Forest碳汇计算完成: {len(forest_records)} 条记录, 总计 {total_sink:,.0f} kt CO2")
+            else:
+                print(f"[WARN] forest_area_df中无森林面积列，可用列: {list(df_forest.columns)}")
+    
+    # 转换为标准格式
+    if records:
+        df_future = pd.DataFrame(records)
+    else:
+        df_future = pd.DataFrame(columns=[
+            'M49_Country_Code', 'year', 'Process', 'Item', 'GHG', 'value'
+        ])
+    
+    # 聚合（可能多个转换贡献到同一个过程）
+    if not df_future.empty:
+        df_future = df_future.groupby(['M49_Country_Code', 'year', 'Process', 'Item', 'GHG'], 
+                                      as_index=False)['value'].sum()
+    
+    # 添加Region_label_new列（从M49映射）
+    if dict_v3_path:
+        try:
+            region_df = pd.read_excel(dict_v3_path, sheet_name='region',
+                                     usecols=['M49_Country_Code', 'Region_label_new'])
+            region_df['M49_Country_Code'] = region_df['M49_Country_Code'].apply(normalize_m49)
+            region_map = dict(zip(region_df['M49_Country_Code'], region_df['Region_label_new']))
+            df_future['Region_label_new'] = df_future['M49_Country_Code'].map(region_map).fillna('Unknown')
+        except Exception as e:
+            print(f"[WARN] 无法加载Region_label_new映射: {e}")
+            df_future['Region_label_new'] = 'Unknown'
+    else:
+        df_future['Region_label_new'] = 'Unknown'
+    
+    # 保证M49_Country_Code为字符串格式（保持原格式）
+    df_future['M49_Country_Code'] = df_future['M49_Country_Code'].astype(str)
+    
+    return {'future': df_future}

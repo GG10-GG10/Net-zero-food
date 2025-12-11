@@ -117,7 +117,12 @@ def apply_scenario_to_data(effects: List[ScenarioEffect], scenario_id: str, univ
         'feed_reduction_by': {},
         'land_carbon_price_by_year': {},
         'ruminant_intake_cap': {},
-        'tax_unit_adder': {}
+        'tax_unit_adder': {},
+        'dm_conversion_multiplier': {},
+        'emission_factor_multiplier': {},      # (country, commodity, process, year) -> multiplier (1.0 - rate)
+        'fertilizer_rate_multiplier': {},      # (country, commodity, year) -> multiplier (1.0 - rate)
+        'yield_multiplier': {},                 # (country, commodity, year) -> multiplier (1.0 + rate)
+        'manure_management_ratio_multiplier': {}  # (country, commodity, year) -> multiplier (1.0 + rate)
     }
     # 预处理：r 动物基准需求（2020）
     base_rumi = {}
@@ -130,9 +135,14 @@ def apply_scenario_to_data(effects: List[ScenarioEffect], scenario_id: str, univ
         if eff.kind in ('feed_efficiency','feed_efficiency_rate','feed_efficiency_improve'):
             for y,val in timeline.items():
                 if eff.unit=='rate':
+                    rate = max(0.0, min(1.0, float(val)))
                     for i in eff.countries:
                         for j in eff.commodities:
-                            out['feed_reduction_by'][i,j,y] = max(0.0, min(1.0, val))
+                            out['feed_reduction_by'][i,j,y] = max(0.0, min(1.0, rate))
+                            key = (i, j, y)
+                            prev = out['dm_conversion_multiplier'].get(key, 1.0)
+                            mult = max(0.0, 1.0 - rate)
+                            out['dm_conversion_multiplier'][key] = max(0.0, prev * mult)
         elif eff.kind in ('land_carbon_price','land_co2_price'):
             for y,val in timeline.items():
                 if eff.unit=='amount':
@@ -143,6 +153,47 @@ def apply_scenario_to_data(effects: List[ScenarioEffect], scenario_id: str, univ
                     for i in eff.countries:
                         cap = (1.0 - val) * base_rumi.get(i, 0.0)
                         out['ruminant_intake_cap'][i,y] = max(0.0, cap)
+        
+        # 新增：排放因子调整（降低排放因子）
+        elif eff.kind in ('emission_factor', 'ef_multiplier', 'emission_factor_multiplier'):
+            for y, val in timeline.items():
+                if eff.unit == 'rate':
+                    # rate是负值表示降低，multiplier = 1.0 + rate (如rate=-0.3, mult=0.7)
+                    mult = max(0.0, 1.0 + float(val))
+                    for i in eff.countries:
+                        for j in eff.commodities:
+                            for p in eff.processes:
+                                out['emission_factor_multiplier'][(i, j, p, y)] = mult
+        
+        # 新增：施肥密度调整（降低施肥量）
+        elif eff.kind in ('fertilizer_rate', 'fertlizer_rate', 'fertilizer_efficiency'):
+            for y, val in timeline.items():
+                if eff.unit == 'rate':
+                    # rate是负值表示降低，multiplier = 1.0 + rate
+                    mult = max(0.0, 1.0 + float(val))
+                    for i in eff.countries:
+                        for j in eff.commodities:
+                            out['fertilizer_rate_multiplier'][(i, j, y)] = mult
+        
+        # 新增：产量提升（提升yield）
+        elif eff.kind in ('yield_rate', 'yield_multiplier', 'yield_improvement'):
+            for y, val in timeline.items():
+                if eff.unit == 'rate':
+                    # rate是正值表示提升，multiplier = 1.0 + rate (如rate=0.3, mult=1.3)
+                    mult = max(0.0, 1.0 + float(val))
+                    for i in eff.countries:
+                        for j in eff.commodities:
+                            out['yield_multiplier'][(i, j, y)] = mult
+        
+        # 新增：粪便管理比率提升
+        elif eff.kind in ('manure_management_ratio', 'mm_ratio', 'manure_ratio'):
+            for y, val in timeline.items():
+                if eff.unit == 'rate':
+                    # rate是正值表示提升，multiplier = 1.0 + rate
+                    mult = max(0.0, 1.0 + float(val))
+                    for i in eff.countries:
+                        for j in eff.commodities:
+                            out['manure_management_ratio_multiplier'][(i, j, y)] = mult
 
     # 根据 land carbon price 生成供应侧税额 adder：等于 价格 ×（该节点的 LULUCF 强度 e0_land）
     # 这里不直接读取 process_meta；在 S4.0_main 里根据 universe.process_meta 的 'category' 识别 LULUCF 过程后填入
@@ -153,22 +204,24 @@ def load_scenarios(xlsx_path: str, universe: Universe, sheet: str='Scenario') ->
     df = pd.read_excel(xlsx_path, sheet_name=sheet)
     df.columns = [str(c).strip() for c in df.columns]
     # 适配列名
-    col_id   = 'Scenario ID'
+    col_id   = 'Scenario ID' if 'Scenario ID' in df.columns else 'ScenarioID'
     col_type = 'Scenario Element' if 'Scenario Element' in df.columns else 'Scenario Type'
-    col_unit = 'Scenario Unit'
+    col_unit = 'Scenario Unit' if 'Scenario Unit' in df.columns else 'Unit'
     col_proc = 'Emis Process' if 'Emis Process' in df.columns else 'Emis process'
     col_reg  = 'Region' if 'Region' in df.columns else 'Country'
-    col_comm = 'Commodity'
+    col_comm = 'Commodity' if 'Commodity' in df.columns else 'Item'
     col_val  = 'Value'
+    
     effects = []
-    for r in df.itertuples(index=False):
-        sid  = getattr(r, col_id)
-        kind = str(getattr(r, col_type)).strip().lower().replace(' ', '_')
-        unit = str(getattr(r, col_unit)).strip().lower()
-        val  = float(getattr(r, col_val))
-        reg  = getattr(r, col_reg, 'All')
-        com  = getattr(r, col_comm, 'All')
-        proc = getattr(r, col_proc, 'All')
+    # 使用iterrows而不是itertuples，因为列名有空格会导致属性名问题
+    for idx, row in df.iterrows():
+        sid  = row[col_id]
+        kind = str(row[col_type]).strip().lower().replace(' ', '_')
+        unit = str(row[col_unit]).strip().lower()
+        val  = float(row[col_val])
+        reg  = row.get(col_reg, 'All')
+        com  = row.get(col_comm, 'All')
+        proc = row.get(col_proc, 'All')
         eff = ScenarioEffect(sid, kind, unit, val, reg, com, proc)
         eff.countries   = _select_countries(universe, reg)
         eff.commodities = _select_commodities(universe, com)
@@ -185,6 +238,7 @@ def load_mc_specs(xlsx_path: str) -> pd.DataFrame:
 def draw_mc_to_params(df_specs: pd.DataFrame, universe: Universe, *, seed: int, draw_idx: int) -> dict:
     rng = np.random.default_rng(seed + draw_idx)
     ef_mult = {}   # ((country, commodity, process, year) -> factor)
+    feed_conv_mult: Dict[Tuple[str, str, int], float] = {}
     for r in df_specs.itertuples(index=False):
         elem = str(getattr(r, 'Element')).lower()
         unit = str(getattr(r, 'Element unit')).lower() if 'Element unit' in df_specs.columns else ''
@@ -195,8 +249,33 @@ def draw_mc_to_params(df_specs: pd.DataFrame, universe: Universe, *, seed: int, 
         hi   = float(getattr(r, 'Max_bound', 1.0))
         regc = str(getattr(r, 'Region_cat', 'All'))
 
+        if hi < lo:
+            lo, hi = hi, lo
+        draw = float(rng.uniform(lo, hi))
+
+        if 'feed efficiency' in elem:
+            if item and item.lower()!='all':
+                comms = _select_commodities(universe, item)
+            else:
+                comms = list(universe.commodities)
+            if not comms:
+                continue
+            if regc and regc.lower()!='all':
+                inv = {}
+                for c, ragg in (universe.region_aggMC_by_country or {}).items():
+                    inv.setdefault(str(ragg), []).append(c)
+                countries = inv.get(regc, [])
+            else:
+                countries = list(universe.countries)
+            if not countries:
+                continue
+            mult = max(0.0, float(draw))
+            for i in countries:
+                for j in comms:
+                    for y in universe.years:
+                        feed_conv_mult[(i, j, y)] = mult
         # 仅支持“排放因子/强度”类不确定性：识别关键字
-        if 'ef' in elem or 'emission' in elem:
+        elif 'ef' in elem or 'emission' in elem:
             procs = _select_processes(universe, proc)
             # 物品选择
             if item and item.lower()!='all':
@@ -213,10 +292,13 @@ def draw_mc_to_params(df_specs: pd.DataFrame, universe: Universe, *, seed: int, 
             else:
                 countries = list(universe.countries)
             # 抽样
-            factor = float(rng.uniform(lo, hi))
+            factor = float(draw)
             for i in countries:
                 for j in comms:
                     for p in procs:
                         for y in universe.years:
                             ef_mult[i,j,p,y] = factor
-    return {'ef_multiplier_by': ef_mult}
+    return {
+        'ef_multiplier_by': ef_mult,
+        'dm_conversion_multiplier': feed_conv_mult
+    }

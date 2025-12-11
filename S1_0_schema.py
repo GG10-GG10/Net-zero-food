@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 @dataclass
 class Node:
     country: str
-    iso3: str
+    iso3: str 
     year: int
     commodity: str
     Q0: float = 0.0
@@ -39,9 +39,10 @@ class Node:
 class Universe:
     countries: List[str]
     iso3_by_country: Dict[str, str]
-    m49_by_country: Dict[str, str] = field(default_factory=dict)
     commodities: List[str]
     years: List[int]
+    m49_by_country: Dict[str, str] = field(default_factory=dict)
+    country_by_m49: Dict[str, str] = field(default_factory=dict)
     processes: List[str] = field(default_factory=list)
     process_meta: Dict[str, Dict[str, str]] = field(default_factory=dict)
     # 供情景/匹配使用
@@ -49,12 +50,34 @@ class Universe:
     item_cat2_by_commodity: Dict[str, str] = field(default_factory=dict)
     ssp_region_by_country: Dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Build reverse M49->country lookup when not provided explicitly."""
+        if not self.country_by_m49 and self.m49_by_country:
+            reverse: Dict[str, str] = {}
+            for country, code in self.m49_by_country.items():
+                if code is None:
+                    continue
+                code_str = str(code).strip()
+                if not code_str:
+                    continue
+                try:
+                    lowered = code_str.lower()
+                except AttributeError:
+                    lowered = ''
+                if lowered in {'nan', 'inf', '-inf'}:
+                    continue
+                try:
+                    code_key = f"'{int(float(code_str)):03d}"  # ✅ 'xxx格式
+                except (ValueError, TypeError):
+                    code_key = f"'{code_str}" if not code_str.startswith("'") else code_str
+                reverse.setdefault(code_key, country)
+            self.country_by_m49 = reverse
+
 @dataclass
 class ScenarioConfig:
     years_hist_start: int = 2010
     years_hist_end: int = 2020
-    years_future_end: int = 2080
-    future_step: int = 10
+    years_future: List[int] = field(default_factory=lambda: [2080])  # 恢复：只跑2080年
     feed_efficiency: float = 1.0
     seed_rate_default: float = 0.05
 

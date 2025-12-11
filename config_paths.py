@@ -16,7 +16,7 @@ def get_input_base() -> str:
     if env:
         return str(Path(env))
     # Default input path
-    return r"G:\\我的云端硬盘\\Work\\Net-zero food\\Code\\input"
+    return r"G:\我的云端硬盘\Work\Net-zero food\Code\input"
 
 
 def get_src_base() -> str:
@@ -29,18 +29,18 @@ def get_src_base() -> str:
     env = os.environ.get("NZF_SRC_DIR")
     if env:
         return str(Path(env))
-    return r"G:\\我的云端硬盘\\Work\\Net-zero food\\Code\\src"
+    return r"G:\我的云端硬盘\Work\Net-zero food\Code\src"
 
 
 def get_results_base(scenario: Optional[str] = None) -> str:
-    """Return the output directory, optionally for a specific scenario.
+    r"""Return the output directory, optionally for a specific scenario.
 
     Preference order:
       1) Environment variable `NZF_OUTPUT_DIR`
-      2) Project default `G:\\我的云端硬盘\\Work\\Net-zero food\\Code\\output`
+      2) Project default `G:\我的云端硬盘\Work\Net-zero food\Code\output`
     """
     env = os.environ.get("NZF_OUTPUT_DIR")
-    base = Path(env) if env else Path(r"C:\\Users\\cheng\\MyDrive\\Work\\Net-zero food\\Code\\output")
+    base = Path(env) if env else Path(r"C:\Users\cheng\MyDrive\Work\Net-zero food\Code\output")
     if scenario:
         base = base / scenario
     return str(base)

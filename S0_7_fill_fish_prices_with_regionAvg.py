@@ -62,13 +62,13 @@ def add_world_row(df: pd.DataFrame, years, meta_defaults=None):
     meta_defaults = meta_defaults or {}
     world_vals = df[years].mean(axis=0, skipna=True).to_dict()
     # Ensure metadata columns exist
-    for c in ["Area Code","M49 Code_xxx","Region_label_new","Region","Region_agg5","Region_agg2"]:
+    for c in ["M49_Country_Code","M49 Code_xxx","Region_label_new","Region","Region_agg5","Region_agg2"]:
         if c not in df.columns:
             df[c] = np.nan
     # Build world row
     world_row = {c: np.nan for c in df.columns}
     world_row.update({
-        "Area Code": meta_defaults.get("Area Code", 5000),
+        "M49_Country_Code": meta_defaults.get("M49_Country_Code", "001"),
         "M49 Code_xxx": meta_defaults.get("M49 Code_xxx", "001"),
         "Region_label_new": meta_defaults.get("Region_label_new", "no"),
         "Region": meta_defaults.get("Region", "World"),
@@ -102,19 +102,19 @@ def main():
 
     # Keep valid areas (exclude Region_label_new == 'no')
     region_valid = region[region["Region_label_new"].astype(str).str.lower() != "no"].copy()
-    region_valid["_AreaCode_merge"] = pd.to_numeric(region_valid["Area Code"], errors="coerce").astype("Int64")
+    region_valid["_M49_merge"] = pd.to_numeric(region_valid["M49_Country_Code"], errors="coerce").astype("Int64")
 
     # Map regions
-    fish["_AreaCode_merge"] = pd.to_numeric(fish["Area Code"], errors="coerce").astype("Int64")
+    fish["_M49_merge"] = pd.to_numeric(fish["M49_Country_Code"], errors="coerce").astype("Int64")
     cols_to_add = [c for c in ["Region_agg5","Region_agg2"] if c in region_valid.columns]
-    fish = fish.merge(region_valid[["_AreaCode_merge"] + cols_to_add].drop_duplicates(),
-                      on="_AreaCode_merge", how="left")
+    fish = fish.merge(region_valid[["_M49_merge"] + cols_to_add].drop_duplicates(),
+                      on="_M49_merge", how="left")
 
     # Ensure years
     years = ensure_year_cols(fish, start=2002, end=2022)
 
     # Reorder columns: meta first if present
-    meta_pref = ["Area Code","M49 Code_xxx","Region_label_new","Region","Region_agg5","Region_agg2"]
+    meta_pref = ["M49_Country_Code","M49 Code_xxx","Region_label_new","Region","Region_agg5","Region_agg2"]
     meta_cols = [c for c in meta_pref if c in fish.columns]
     fish = fish[meta_cols + years + [c for c in fish.columns if c not in meta_cols + years]]
 
@@ -132,11 +132,11 @@ def main():
     fish = backward_moving_average(fish, years, W=W)
 
     # (4) Append World row
-    fish = add_world_row(fish, years, meta_defaults={"Area Code": 5000, "M49 Code_xxx": "001", "Region_label_new": "no", "Region": "World"})
+    fish = add_world_row(fish, years, meta_defaults={"M49_Country_Code": "001", "M49 Code_xxx": "001", "Region_label_new": "no", "Region": "World"})
 
     # Sort and save
-    if "Area Code" in fish.columns:
-        fish = fish.sort_values("Area Code", kind="mergesort").reset_index(drop=True)
+    if "M49_Country_Code" in fish.columns:
+        fish = fish.sort_values("M49_Country_Code", kind="mergesort").reset_index(drop=True)
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     fish.to_csv(out_csv, index=False)
